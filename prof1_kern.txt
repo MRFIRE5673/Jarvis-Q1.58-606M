@@ -1,0 +1,24 @@
+﻿Generating SQLite file prof1.sqlite from prof1.nsys-rep
+Processing [prof1.sqlite] with [C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.1.3\target-windows-x64\reports\cuda_gpu_kern_sum.py]... 
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+27.2,352184397,1920,183429.4,165887.0,121663,424766,46459.4,"scan16_k(const __nv_bfloat16 *, int, const __nv_bfloat16 *, int, const __nv_bfloat16 *, int, __nv_bfloat16 *, int, const float *, int, int, int, int)"
+12.7,163945858,30720,5336.8,4448.0,3839,225247,3998.5,"amax_bf16_kernel(const __nv_bfloat16 *, int, float *)"
+9.3,119800353,6912,17332.2,16480.0,9312,248671,7400.0,nvjet_sm120_qqtst_mma_128x176x128_2_32x88x128_tmaAB_alignCD4_bz_TNNN
+7.2,93016152,488,190606.9,127775.5,1088,2313204,235086.9,"adamw_vec4_kernel(float *, __nv_bfloat16 *, float *, float *, const __nv_bfloat16 *, float, float, float, float, float, const float *, const float *, const float *, int)"
+6.9,89577227,4032,22216.6,23616.0,11776,334495,11834.8,nvjet_sm120_qrtst_mma_128x176x128_2_32x88x128_tmaAB_alignCD4_bx_TNNN
+5.6,72851162,11520,6323.9,7296.0,3967,228767,5153.1,"cast_fp8_T_kernel(const __nv_bfloat16 *, unsigned char *, int, int, const float *, float *, int)"
+5.3,68100896,3648,18668.0,19680.0,9343,255646,6635.2,nvjet_sm120_qrtst_mma_128x176x128_2_32x88x128_tmaAB_alignCD4_bz_TNNN
+3.4,43847499,19200,2283.7,2496.0,1728,10432,440.9,"cast_fp8_kernel(const __nv_bfloat16 *, unsigned char *, int, const float *, float *, int)"
+2.5,32414429,384,84412.6,83295.0,81439,259390,12749.7,"lsf_bwd_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, __nv_bfloat16 *, float *, int, int, int)"
+2.4,31579673,768,41119.4,40896.0,25888,257855,8124.3,"gelu_fwd_stash_vec8_kernel(const __nv_bfloat16 *, __nv_bfloat16 *, __nv_bfloat16 *, int)"
+2.2,28107623,384,73196.9,70656.0,62015,298111,21563.5,"gelu_bwd_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int)"
+1.7,22274409,16,1392150.6,1361784.0,1360088,1609720,81047.3,nvjet_sm120_tst_mma_256x128x64_2_64x64x64_tmaAB_alignCD4_bz_TNNN
+1.6,21184081,16,1324005.1,1288138.0,1283257,1491480,81204.2,void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_nn_align8>(T1::Params)
+1.6,20098810,768,26170.3,25248.0,24928,257535,14219.6,nvjet_sm120_qqtst_mma_128x128x64_6_64x64x64_tmaAB_alignCD4_bz_TNNN
+1.4,18256191,16,1141011.9,1130201.5,1127803,1301753,42906.0,"reflective_penalty_kernel(const __nv_bfloat16 *, float *, float *, float, float, float, int)"
+1.3,17323588,12,1443632.3,1408200.5,1400472,1633431,88484.3,nvjet_sm120_tst_mma_128x256x64_2_64x64x64_tmaAB_alignCD4_bx_NTNN
+0.8,10875751,1552,7007.6,6144.0,5216,17440,1678.5,"rmsnorm_fwd_k(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, __nv_bfloat16 *, int, float)"
+0.8,10874931,784,13871.1,14336.0,10976,17920,1198.5,"rmsnorm_bwd_k(const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, float *, int, float)"
+0.7,8417236,384,21919.9,20832.0,19456,219519,14316.1,"feat_bwd_k(const __nv_bfloat16 *, const float *, const float *, __nv_bfloat16 *, int, int, int, float)"
+0.6,8045237,192,41902.3,39888.0,20127,64224,20478.5,"abs_sum_kernel(const float *, float *, int)"
+0.6,7751104,768,10092.6,10016.0,9696,17952,400.8,"feat_k(const __nv_bfloat16 *, const float *, const float *, __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, float)"
