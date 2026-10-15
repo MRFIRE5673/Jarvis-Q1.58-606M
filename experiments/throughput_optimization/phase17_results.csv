@@ -1,6 +1,0 @@
-Configuration,Step_Time_ms,Throughput_tok_s,Speedup_vs_PyTorch,VRAM_Allocated_MiB,VRAM_Reserved_MiB,Kernel_Launches,DRAM_Traffic_MB,TFLOPs,Status
-Config_A_PyTorch_Production,777.44,5268.5,1.00x,4890.9,5904.0,1440,6744.5,19.17,Empirical_Verified
-Config_B_Native_CUDA_Eager,311.49,13149.5,2.50x,4890.9,5904.0,336,2214.5,47.85,Empirical_Verified
-Config_C_D_Native_CUDA_Graph_Fused_Opt,230.98,17733.0,3.37x,4890.9,5904.0,1,2214.5,64.52,Empirical_Verified
-Config_E_Pipelined_Fusion_Projection,166.78,24560.0,4.66x,4890.9,5904.0,1,1890.2,89.36,Projected_Phase16_Scale
-Target_Roofline_35K,117.03,35000.0,6.64x,4890.9,5904.0,1,1620.0,127.34,Theoretical_Peak_Target

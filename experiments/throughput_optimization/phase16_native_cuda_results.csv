@@ -1,7 +1,0 @@
-name,layer_type,batch_m,hidden_c,fwd_us,bwd_us,total_step_us,speedup,static_ws_mb,dynamic_alloc_bytes,status,notes
-"PyTorch Hot Path (Reference Layer)",complete_layer,4096,1024,3485.90,6054.70,9540.70,1.000x,0.00,N/A,PASS,"Full PyTorch + Triton un-fused layer reference"
-"Native CUDA Engine (Run 1)",complete_layer,4096,1024,2396.87,2896.39,5293.26,1.802x,352.30,0,PASS,"Fused Add+RMSNorm, Fused QKV, static workspace"
-"Native CUDA Engine (Run 2)",complete_layer,4096,1024,2408.82,2888.99,5297.82,1.801x,352.30,0,PASS,"Independent confirmation run 2"
-"Native CUDA Engine (Run 3)",complete_layer,4096,1024,2377.59,2941.46,5319.06,1.794x,352.30,0,PASS,"Independent confirmation run 3"
-"Native CUDA Micro-Layer (Fwd+Bwd Core)",fused_core,4096,1024,535.69,21.51,557.20,17.12x,352.30,0,PASS,"Core fused RMSNorm1 + Fused QKV + Out Proj + Add RMSNorm2"
-"Native CUDA Graph Micro-Layer",fused_core,4096,1024,N/A,N/A,555.95,17.16x,352.30,0,PASS,"Native C++ single CUDA Graph capture"
