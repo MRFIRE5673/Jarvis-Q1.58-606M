@@ -200,6 +200,16 @@ struct JarvisWorkspace {
     float* stash_rsqrt2 = nullptr;  // [L, NT] FP32 inverse RMS for norm2
     bf16*  stash_h1     = nullptr;  // [L, NTK, hi]  pre-GELU (for GELU bwd)
 
+    // Pre-quantized FP8 weight caches (quantized once per step, E4M3)
+    uint8_t** qkv_q8    = nullptr;  // [L] -> [3C*C] FP8
+    uint8_t** out_q8    = nullptr;  // [L] -> [C*C]  FP8
+    uint8_t** w1_q8     = nullptr;  // [L] -> [E*hi*C] FP8
+    uint8_t** w2_q8     = nullptr;  // [L] -> [E*C*hi] FP8
+    float**   qkv_inv   = nullptr;  // [L] -> [1] inv scale for qkv_q8
+    float**   out_inv   = nullptr;  // [L] -> [1] inv scale for out_q8
+    float**   w1_inv    = nullptr;  // [L] -> [1] inv scale for w1_q8
+    float**   w2_inv    = nullptr;  // [L] -> [1] inv scale for w2_q8
+
     // Gradient buffers — reused across layers
     bf16*  d_logits     = nullptr;  // [NT, Vpad]
     bf16*  d_x          = nullptr;  // [NT, C]   gradient flowing backward

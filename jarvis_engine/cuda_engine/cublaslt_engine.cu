@@ -114,6 +114,12 @@ static void quant_fp8(const bf16* x, uint8_t* y, int rows, int cols, bool tr, in
     }
 }
 
+// Non-static wrapper so full_engine.cu can fill the per-layer FP8 weight caches.
+void quant_fp8_device(const bf16* x, uint8_t* y, int rows, int cols, bool tr, int e5,
+                      float* d_amax, float* d_inv, cudaStream_t s) {
+    quant_fp8(x, y, rows, cols, tr, e5, d_amax, d_inv, s);
+}
+
 void CublasLtEngine::gemm_fp8(int M, int N, int K, const bf16* X, const bf16* W, bf16* Y,
                               cudaStream_t s) const {
     gemm_fp8_ex(M, N, K, X, W, Y, false, false, false, 0.f, s);
@@ -160,8 +166,45 @@ void CublasLtEngine::gemm_fp8_ex(int M, int N, int K, const bf16* X, const bf16*
     cublasLtMatmulDescDestroy(op);
 }
 
-// ---------------------------------------------------------------------------
-// Singleton
+// gemm_fp8_cached: W already quantized in W_q8 (E4M3, [N,K] row-major), d_inv_w device ptr to inv scale.
+// Quantizes X (E4M3) on the fly. C[M,N] = X[M,K] * W[N,K]^T.
+void CublasLtEngine::gemm_fp8_cached(int M, int N, int K,
+                                      const bf16* X, const uint8_t* W_q8,
+                                      const float* d_inv_w, bf16* Y, cudaStream_t s) const {
+    quant_fp8(X, x8, M, K, false, 0, f8_stat + 0, f8_stat + 2, s);
+
+    cublasLtMatmulDesc_t op;
+    CUBLAS_CHECK((cublasStatus_t)cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    cublasOperation_t T = CUBLAS_OP_T, Nn = CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &T, sizeof(T));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &Nn, sizeof(Nn));
+    const void* a_sc = d_inv_w;        // pre-stored device inverse scale
+    const void* b_sc = f8_stat + 2;   // activation inverse scale (just computed)
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_sc, sizeof(a_sc));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_sc, sizeof(b_sc));
+
+    cublasLtMatrixLayout_t la, lb, lc;
+    cublasLtMatrixLayoutCreate(&la, CUDA_R_8F_E4M3, K, N, K);
+    cublasLtMatrixLayoutCreate(&lb, CUDA_R_8F_E4M3, K, M, K);
+    cublasLtMatrixLayoutCreate(&lc, CUDA_R_16BF, N, M, N);
+
+    cublasLtMatmulPreference_t pref;
+    cublasLtMatmulPreferenceCreate(&pref);
+    size_t wsz = 32u << 20;
+    cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsz, sizeof(wsz));
+    cublasLtMatmulHeuristicResult_t r; int n = 0;
+    cublasLtMatmulAlgoGetHeuristic(lt, op, la, lb, lc, lc, pref, 1, &r, &n);
+    if (!n) throw std::runtime_error("[cuBLASLt] no FP8 algo (cached)");
+
+    float alpha = 1.f, beta = 0.f;
+    CUBLAS_CHECK((cublasStatus_t)cublasLtMatmul(lt, op, &alpha, W_q8, la, x8, lb, &beta,
+                                                Y, lc, Y, lc, &r.algo, lt_ws, wsz, s));
+    cublasLtMatmulPreferenceDestroy(pref);
+    cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(lc);
+    cublasLtMatmulDescDestroy(op);
+}
+
+
 // ---------------------------------------------------------------------------
 static CublasLtEngine g_cublaslt;
 CublasLtEngine& get_cublaslt() { return g_cublaslt; }

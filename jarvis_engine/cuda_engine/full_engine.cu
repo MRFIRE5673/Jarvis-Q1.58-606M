@@ -91,7 +91,10 @@ static JarvisEngine g_engine;
 JarvisEngine& get_engine() { return g_engine; }
 
 // ---------------------------------------------------------------------------
-// Helper: quantize one FP32 weight tensor to BF16 ternary in-place
+// quant_fp8_device: same as quant_fp8 but writes inv scale to a device pointer
+extern void quant_fp8_device(const bf16* x, uint8_t* y, int rows, int cols, bool tr, int e5,
+                             float* d_amax, float* d_inv, cudaStream_t s);
+
 // ---------------------------------------------------------------------------
 static void quantize_weight(float* fp32, float* alpha_scratch,
                              bf16* bf16_out, int N, cudaStream_t s) {
@@ -156,9 +159,11 @@ void JarvisEngine::quantize_all_weights() {
         quantize_weight(params.out_fp32[l],    quant_alpha, params.out_w[l],   C*C,     s);
         quantize_weight(params.exp_w1_fp32[l], quant_alpha, params.expert_w1[l], E*hi*C, s);
         quantize_weight(params.exp_w2_fp32[l], quant_alpha, params.expert_w2[l], E*C*hi, s);
-        // Router W is small and not ternary — copy FP32 master to BF16 directly
-        // (no quantize needed; router_w is BF16 copy of router_fp32)
-        // For now: skip (router_w is already BF16 set by load_checkpoint)
+        // Fill FP8 caches: amax scratch reuses quant_alpha (sequential, same stream)
+        quant_fp8_device(params.qkv_w[l],    ws.qkv_q8[l], 3*C, C,   false, 0, quant_alpha, ws.qkv_inv[l], s);
+        quant_fp8_device(params.out_w[l],    ws.out_q8[l], C,   C,   false, 0, quant_alpha, ws.out_inv[l], s);
+        quant_fp8_device(params.expert_w1[l], ws.w1_q8[l], E*hi, C,  false, 0, quant_alpha, ws.w1_inv[l],  s);
+        quant_fp8_device(params.expert_w2[l], ws.w2_q8[l], E*C, hi,  false, 0, quant_alpha, ws.w2_inv[l],  s);
     }
 }
 
@@ -407,26 +412,32 @@ static void layer_core(JarvisEngine& E, int l, const bf16* xin) {
     const int Ee = cfg.n_experts, hi = cfg.expert_hidden, B = cfg.batch_size, T = cfg.seq_len;
     bf16* x2 = ws.dispatch_x;
 
-    lt.fp8_fwd = true;
+    // FP8 forward using pre-quantized weight cache (only activation is quantized per call)
     launch_rmsnorm_fwd(xin, P.norm1_w[l], ws.norm1_out, nullptr, NT, C, s);
-    lt.qkv_proj_fwd(ws.norm1_out, P.qkv_w[l], ws.qkv_out, NT, C, s);
+    lt.gemm_fp8_cached(NT, 3*C, C, ws.norm1_out, ws.qkv_q8[l], ws.qkv_inv[l], ws.qkv_out, s);
     launch_attn_fwd2(ws.qkv_out, P.gamma_raw[l], E.rope_cos, E.rope_sin, ws.attn_out, ws.q_buf, ws.k_buf, B, H, T, D, C, s);
-    lt.out_proj_fwd(ws.attn_out, P.out_w[l], ws.layer_x2, NT, C, s);
+    lt.gemm_fp8_cached(NT, C, C, ws.attn_out, ws.out_q8[l], ws.out_inv[l], ws.layer_x2, s);
     launch_add_residual(xin, ws.layer_x2, x2, NT * C, s);
     launch_rmsnorm_fwd(x2, P.norm2_w[l], ws.norm2_out, nullptr, NT, C, s);
 
     lt.router_fwd(ws.norm2_out, P.router_w[l], ws.router_logits, NT, C, Ee, s);
     launch_top2_gating(ws.router_logits, ws.router_probs, ws.topk_idx, ws.topk_gates, NT, Ee, s);
 
-    for (int e = 0; e < Ee; ++e)
-        lt.expert_w1_fwd(ws.norm2_out, P.expert_w1[l] + (size_t)e * hi * C,
-                         ws.layer_h1 + (size_t)e * NT * hi, NT, hi, C, s);
-    launch_gelu_fwd_stash(ws.layer_h1, ws.stash_h1, ws.layer_h1, Ee * NT * hi, s);
-    for (int e = 0; e < Ee; ++e)
-        lt.expert_w2_fwd(ws.layer_h1 + (size_t)e * NT * hi, P.expert_w2[l] + (size_t)e * C * hi,
-                         ws.expert_out + (size_t)e * NT * C, NT, C, hi, s);
+    for (int e = 0; e < Ee; ++e) {
+        lt.gemm_fp8_cached(NT, hi, C, ws.norm2_out,
+                           ws.w1_q8[l] + (size_t)e * hi * C, ws.w1_inv[l],
+                           ws.layer_h1 + (size_t)e * NT * hi, s);
+        launch_gelu_fwd_stash(ws.layer_h1 + (size_t)e * NT * hi,
+                              ws.stash_h1 + (size_t)e * NT * hi,
+                              ws.layer_h1 + (size_t)e * NT * hi,
+                              NT * hi, s);
+        lt.gemm_fp8_cached(NT, C, hi,
+                           ws.layer_h1 + (size_t)e * NT * hi,
+                           ws.w2_q8[l] + (size_t)e * C * hi, ws.w2_inv[l],
+                           ws.expert_out + (size_t)e * NT * C, s);
+    }
     launch_moe_combine_fwd(ws.expert_out, x2, ws.topk_idx, ws.topk_gates, ws.moe_out, NT, C, s);
-    lt.fp8_fwd = false;
+
 }
 
 // ===========================================================================
@@ -512,7 +523,7 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
                                ws.d_dispatch, ws.dg, NT, C, E, s);
         launch_router_bwd2(ws.router_probs, ws.topk_idx, ws.dg, ws.d_rlogits, NT, s);
 
-        // Experts: W2 grads, dH, GELU bwd, W1 grads, dn2
+        // Experts: W2 grads, dH, GELU bwd, W1 grads, dn2 (interleaved per expert for L2 cache locality)
         for (int e = 0; e < E; ++e) {
             const bf16* dy_e = ws.d_dispatch + (size_t)e * NT * C;
             lt.generic_bwd_dw(dy_e, ws.layer_h1 + (size_t)e * NT * hi,
@@ -520,9 +531,10 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
             GemmDesc d1 = {NT, hi, C};
             lt.gemm_nn(d1, dy_e, params.expert_w2[l] + (size_t)e * C * hi,
                        ws.d_h1 + (size_t)e * NT * hi, 1.0f, 0.0f, s);
-        }
-        launch_gelu_bwd(ws.stash_h1, ws.d_h1, ws.d_h1, E * NT * hi, s);
-        for (int e = 0; e < E; ++e) {
+            launch_gelu_bwd(ws.stash_h1 + (size_t)e * NT * hi,
+                            ws.d_h1 + (size_t)e * NT * hi,
+                            ws.d_h1 + (size_t)e * NT * hi,
+                            NT * hi, s);
             const bf16* dh_e = ws.d_h1 + (size_t)e * NT * hi;
             lt.generic_bwd_dw(dh_e, ws.norm2_out, ws.d_exp_w1[l] + (size_t)e * hi * C, hi, C, NT, beta, s);
             GemmDesc d2 = {NT, C, hi};

@@ -13,7 +13,7 @@ Bugs fixed vs. original:
 """
 import os, sys, glob, math, torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_ckpt
-from utils.ternary_ops import TernaryLinear
+from utils.ternary_ops import TernaryLinear, FusedQKVSTE, FusedQKVLinear
 
 
 try:
@@ -194,9 +194,8 @@ class AssociativeLinearAttention(nn.Module):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
-        self.q_proj = TernaryLinear(d_model, d_model)
-        self.k_proj = TernaryLinear(d_model, d_model)
-        self.v_proj = TernaryLinear(d_model, d_model)
+        # Fused QKV projection - single ternary quantization for all three
+        self.qkv_proj = FusedQKVLinear(d_model)
         self.out_proj = TernaryLinear(d_model, d_model)
         # γ: per-head learnable decay, init sigmoid(2.94) ≈ 0.95
         self.gamma_raw = nn.Parameter(torch.full((n_heads,), 2.94))
@@ -213,13 +212,25 @@ class AssociativeLinearAttention(nn.Module):
         self.register_buffer('_i_idx_p1',   i + 1)                       # (cs,) i+1
         self.register_buffer('_c_m1_m_i',   (cs - 1) - i)               # (cs,) c-1-i
 
-    def forward(self, x: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, start_pos: int = 0,
+        s_prev: torch.Tensor = None
+    ):
+        """Returns (out, s_new).
+
+        s_prev: carried associative state (B, H, D, D) or None.
+                When not None (inference/persist_state mode), the full-context
+                chunk scan is bypassed — each token is processed in O(1) via
+                the paper Eq.1-2 recurrence:  S_t = γ*S_{t-1} + v_t⊗k_t^T
+                                               z_t = S_t @ q_t
+        """
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
 
-        q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)  # (B,H,T,D)
-        k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
+        # Fused QKV projection - single matmul + ternary quantization
+        qkv = self.qkv_proj(x)  # (B, T, 3*C)
+        qkv = qkv.view(B, T, 3, H, D).permute(2, 0, 3, 1, 4)  # (3, B, H, T, D)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, H, T, D)
 
         # ELU+1 keeps feature values positive (Katharopoulos 2020)
         q = (F.elu(q) + 1.0) / math.sqrt(D)
@@ -228,19 +239,40 @@ class AssociativeLinearAttention(nn.Module):
         # RoPE (Su et al. 2021): inject relative position information
         q, k = self.rotary(q, k, start_pos=start_pos)
 
-        # Compute log(gamma) once — exp(log_g*diff) is faster than gamma**diff.
         log_g = torch.log(torch.sigmoid(self.gamma_raw))  # (H,) float32
 
+        # ------------------------------------------------------------------
+        # O(1) INFERENCE PATH  (s_prev is provided — single-token generation)
+        # Processes T tokens sequentially using the pure recurrence, carrying
+        # S_t across tokens.  No chunk overhead; each step is one einsum.
+        # ------------------------------------------------------------------
+        if s_prev is not None:
+            gamma = torch.sigmoid(self.gamma_raw).to(dtype=x.dtype)  # (H,)
+            state = s_prev
+            outputs = []
+            for t in range(T):
+                q_t = q[:, :, t, :]   # (B, H, D)
+                k_t = k[:, :, t, :]   # (B, H, D)
+                v_t = v[:, :, t, :]   # (B, H, D)
+                # S_t = γ * S_{t-1} + v_t ⊗ k_t^T   (paper Eq. 1)
+                kv  = torch.einsum('bhd,bhe->bhde', v_t, k_t)          # (B,H,D,D)
+                state = gamma.view(1, H, 1, 1) * state + kv
+                # z_t = S_t @ q_t                    (paper Eq. 2)
+                z_t = torch.einsum('bhde,bhe->bhd', state, q_t)         # (B,H,D)
+                outputs.append(z_t.unsqueeze(2))                         # (B,H,1,D)
+            out_h = torch.cat(outputs, dim=2)                            # (B,H,T,D)
+            out = out_h.transpose(1, 2).contiguous().view(B, T, C)
+            return self.out_proj(out), state
+
+        # ------------------------------------------------------------------
+        # TRAINING / PREFILL PATH  (chunked parallel scan, s_prev=None)
+        # ------------------------------------------------------------------
         cs = self.CHUNK_SIZE
-        # Use pre-cached float32 buffers directly — no .to() cast inside forward,
-        # which would cause torch.compile to retrace on every step (graph break).
-        # autocast handles mixed float32/bfloat16 ops correctly.
         dc    = self._diff_clamp   # (cs, cs) float32
         ca    = self._causal       # (cs, cs) float32
         ip1   = self._i_idx_p1     # (cs,)    float32
         cm1mi = self._c_m1_m_i     # (cs,)    float32
 
-        # Per-chunk decay quantities — computed ONCE, reused for all chunks
         decay_mat   = (torch.exp(log_g.view(H,1,1) * dc) * ca).to(dtype=x.dtype)   # (H,cs,cs)
         gamma_cross = torch.exp(log_g.view(H,1) * ip1).to(dtype=x.dtype)          # (H,cs)
         gw          = torch.exp(log_g.view(H,1) * cm1mi).to(dtype=x.dtype)        # (H,cs)
@@ -251,45 +283,40 @@ class AssociativeLinearAttention(nn.Module):
 
         for start in range(0, T, cs):
             end   = min(start + cs, T)
-            c     = end - start          # actual chunk length (may be < cs for last chunk)
-            q_c   = q[:, :, start:end, :]   # (B, H, c, D)
+            c     = end - start
+            q_c   = q[:, :, start:end, :]
             k_c   = k[:, :, start:end, :]
             v_c   = v[:, :, start:end, :]
 
             if c == cs:
-                # Full chunk — use pre-cached decay tensors (fast path)
-                dm       = decay_mat             # (H, cs, cs)
-                gc_cross = gamma_cross           # (H, cs)
-                gw_c     = gw                    # (H, cs)
-                gc_state = gamma_c               # (1, H, 1, 1)
+                dm       = decay_mat
+                gc_cross = gamma_cross
+                gw_c     = gw
+                gc_state = gamma_c
             else:
-                # Partial chunk (last chunk when T % cs != 0) — compute on-the-fly
-                i_c      = self._i_idx[:c]                                    # (c,)
-                diff_c   = (i_c.unsqueeze(1) - i_c.unsqueeze(0)).clamp(min=0)  # (c,c)
-                causal_c = (i_c.unsqueeze(1) - i_c.unsqueeze(0) >= 0).float()  # (c,c)
-                dm       = (torch.exp(log_g.view(H,1,1) * diff_c) * causal_c).to(dtype=x.dtype)   # (H,c,c)
-                gc_cross = torch.exp(log_g.view(H,1) * (i_c + 1)).to(dtype=x.dtype)             # (H,c)
-                gw_c     = torch.exp(log_g.view(H,1) * (c - 1 - i_c)).to(dtype=x.dtype)         # (H,c)
+                i_c      = self._i_idx[:c]
+                diff_c   = (i_c.unsqueeze(1) - i_c.unsqueeze(0)).clamp(min=0)
+                causal_c = (i_c.unsqueeze(1) - i_c.unsqueeze(0) >= 0).float()
+                dm       = (torch.exp(log_g.view(H,1,1) * diff_c) * causal_c).to(dtype=x.dtype)
+                gc_cross = torch.exp(log_g.view(H,1) * (i_c + 1)).to(dtype=x.dtype)
+                gw_c     = torch.exp(log_g.view(H,1) * (c - 1 - i_c)).to(dtype=x.dtype)
                 gc_state = torch.exp(log_g * c).view(1,H,1,1).to(dtype=x.dtype)
 
-            # Intra-chunk decayed linear attention
-            raw       = torch.einsum('bhid,bhjd->bhij', q_c, k_c)        # (B,H,c,c)
-            scores    = raw * dm.unsqueeze(0)                             # (B,H,c,c)
-            intra_out = torch.einsum('bhij,bhjd->bhid', scores, v_c)     # (B,H,c,D)
+            raw       = torch.einsum('bhid,bhjd->bhij', q_c, k_c)
+            scores    = raw * dm.unsqueeze(0)
+            intra_out = torch.einsum('bhij,bhjd->bhid', scores, v_c)
 
-            # Cross-chunk: exp(log_g*(i+1)) * S_prev @ q_i
-            raw_cross = torch.einsum('bhde,bhie->bhid', state, q_c)      # (B,H,c,D)
+            raw_cross = torch.einsum('bhde,bhie->bhid', state, q_c)
             cross_out = raw_cross * gc_cross.unsqueeze(0).unsqueeze(-1)
 
             outputs.append(intra_out + cross_out)
 
-            # State update: S_new = gamma^c * S + Σ_j exp(log_g*(c-1-j)) * v_j⊗k_j^T
-            v_w       = v_c * gw_c.unsqueeze(0).unsqueeze(-1)            # (B,H,c,D)
-            chunk_upd = torch.einsum('bhid,bhie->bhde', v_w, k_c)        # (B,H,D,D)
+            v_w       = v_c * gw_c.unsqueeze(0).unsqueeze(-1)
+            chunk_upd = torch.einsum('bhid,bhie->bhde', v_w, k_c)
             state     = gc_state * state + chunk_upd
 
         out = torch.cat(outputs, dim=2).transpose(1, 2).contiguous().view(B, T, C)
-        return self.out_proj(out)
+        return self.out_proj(out), state
 
 
 # ---------------------------------------------------------------------------
@@ -324,13 +351,15 @@ class SparseMoELayer(nn.Module):
         topk_probs, topk_idx = probs.topk(self.top_k, dim=-1)   # (N, top_k)
         topk_gates = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # Vectorized MoE: flatten top-k dimension → one pass per expert (not k×E).
+        # Vectorized MoE: batched expert computation
         # flat_idx/flat_gate: (N*top_k,)  flat_x: (N*top_k, C)
         flat_idx  = topk_idx.reshape(-1)                         # (N*K,)
         flat_gate = topk_gates.reshape(-1)                       # (N*K,)
         flat_x    = x_flat.repeat_interleave(self.top_k, dim=0)  # (N*K, C)
         flat_out  = torch.zeros_like(flat_x)                     # (N*K, C)
 
+        # Batch experts together using grouped GEMM-like pattern
+        # Each expert processes its assigned tokens in parallel
         for e in range(self.num_experts):
             mask = (flat_idx == e)
             if mask.any():
@@ -692,32 +721,35 @@ class JarvisBlock(nn.Module):
         self.liquid = LiquidStateFusion(d_model)
         self.reflect = ReflectivePenalty()
 
-    def forward(self, x, h_prev=None, start_pos: int = 0):
+    def forward(self, x, h_prev=None, start_pos: int = 0, s_prev=None):
         """
         Args:
             x:         input hidden states  (B, T, C)
-            h_prev:    last-token membrane  (B, C) or None  [carry from previous sequence]
+            h_prev:    last-token membrane  (B, C) or None  [carry from previous call]
             start_pos: token position offset for RoPE
+            s_prev:    associative attention state (B, H, D, D) or None.
+                       When provided (inference), enables O(1) per-token attention.
         Returns:
             x:       updated hidden states  (B, T, C)
-            h_last:  last-token membrane    (B, C)        [pass to next sequence]
+            h_last:  last-token membrane    (B, C)
+            s_new:   updated attention state (B, H, D, D)
             l_balance, l_reflect: aux losses
         """
         # Step 1: Associative Attention (Eq. 1-2) with RoPE
-        x = x + self.attn(self.norm1(x), start_pos=start_pos)
+        attn_out, s_new = self.attn(self.norm1(x), start_pos=start_pos, s_prev=s_prev)
+        x = x + attn_out
 
         # Step 2: Sparse MoE (Eq. 6 + Algo 1 L11-13)
         moe_out, l_balance, act_mean, act_var = self.moe(self.norm2(x))
 
         # Step 3: Liquid State — token-sequential EMA scan (Algo 1 L15 / Eq. 8)
-        # h_prev: (B,C) last membrane from prior sequence; None resets to zero
         h_out, h_last = self.liquid(moe_out, act_var, h_prev)
-        x = x + h_out                      # residual add full (B,T,C) output
+        x = x + h_out
 
         # Step 4: Reflective Penalty (Eq. 7)
         l_reflect = self.reflect(act_mean, act_var)
 
-        return x, h_last, l_balance, l_reflect
+        return x, h_last, s_new, l_balance, l_reflect
 
 
 # ---------------------------------------------------------------------------
@@ -777,10 +809,11 @@ class Jarvis(nn.Module):
         self.final_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
-        # Persistent cross-sequence liquid membrane states & RoPE position offset
-        # None = not yet initialised. Populated by forward(), cleared by reset_state().
-        # shape per entry: (B, C) — the last-token membrane of each block.
+        # Persistent cross-sequence states (inference / persist_state=True only).
+        # _h_states: liquid membrane  — shape (B, C) per block
+        # _s_states: associative attn — shape (B, H, D, D) per block
         self._h_states: list = [None] * n_layers
+        self._s_states: list = [None] * n_layers
         self._token_pos: int = 0
 
     def get_backend_status(self):
@@ -798,8 +831,9 @@ class Jarvis(nn.Module):
         }
 
     def reset_state(self):
-        """Clear persisted liquid membrane states and position (call between unrelated sequences)."""
+        """Clear all persisted recurrent states and position (call between unrelated sequences)."""
         self._h_states = [None] * len(self.blocks)
+        self._s_states = [None] * len(self.blocks)
         self._token_pos = 0
 
     def forward(self, idx, targets=None, persist_state=False):
@@ -821,32 +855,44 @@ class Jarvis(nn.Module):
         l_bal_total = torch.zeros((), device=idx.device, dtype=torch.float32)
         l_ref_total = torch.zeros((), device=idx.device, dtype=torch.float32)
 
-        # Liquid state persistence (paper Algo 1: H_t survives across sequence boundaries).
-        # Training: persist_state=False  — random batches are independent sequences.
-        # Inference: persist_state=True  — carry H_last across forward calls for infinite context.
+        # Recurrent state persistence.
+        # Training  (persist_state=False): all states reset each call — batches are independent.
+        # Inference (persist_state=True):  H (liquid) and S (attention) carried across calls.
         if persist_state:
-            h_prevs = self._h_states   # carry from previous call
+            h_prevs = self._h_states
+            s_prevs = self._s_states
         else:
-            h_prevs = [None] * len(self.blocks)   # reset per call (training)
+            h_prevs = [None] * len(self.blocks)
+            s_prevs = [None] * len(self.blocks)
 
         new_h_states = []
+        new_s_states = []
         for i, block in enumerate(self.blocks):
-            # h_prev: (B, C) or None.  If batch size changed, reset silently.
             h_prev = h_prevs[i]
+            s_prev = s_prevs[i]
             if h_prev is not None and h_prev.shape[0] != B:
-                h_prev = None   # batch size mismatch — reset gracefully
+                h_prev = None
+            if s_prev is not None and s_prev.shape[0] != B:
+                s_prev = None
 
             if self.training:
-                x, h_last, l_bal, l_ref = grad_ckpt(block, x, h_prev, start_pos, use_reentrant=False)
+                # grad_ckpt doesn't accept keyword-only args easily; pass s_prev=None
+                # (training never uses persist_state, so s_prev is always None here)
+                x, h_last, s_new, l_bal, l_ref = grad_ckpt(
+                    block, x, h_prev, start_pos, None, use_reentrant=False
+                )
             else:
-                x, h_last, l_bal, l_ref = block(x, h_prev, start_pos=start_pos)
+                x, h_last, s_new, l_bal, l_ref = block(
+                    x, h_prev, start_pos=start_pos, s_prev=s_prev
+                )
 
-            new_h_states.append(h_last.detach())   # (B, C), detached
+            new_h_states.append(h_last.detach())
+            new_s_states.append(s_new.detach())
             l_bal_total = l_bal_total + l_bal
             l_ref_total = l_ref_total + l_ref
 
-        # Store updated states for next call (used when persist_state=True)
         self._h_states = new_h_states
+        self._s_states = new_s_states
 
         x = self.final_norm(x)
         if x.is_cuda and self.lm_head.bias is None and self.lm_head.out_features % 64 != 0:

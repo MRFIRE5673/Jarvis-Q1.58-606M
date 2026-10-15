@@ -209,7 +209,16 @@ class CUDAAssociativeLinearAttention(nn.Module):
         self.register_buffer('_c_m1_m_i', (cs - 1) - i)
         self.register_buffer('_i_idx', i)
 
-    def forward(self, x: torch.Tensor, start_pos: int = 0, h_prev: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, start_pos: int = 0,
+        h_prev: torch.Tensor = None,
+        s_prev: torch.Tensor = None
+    ):
+        """Returns (out, s_new).
+
+        s_prev: carried associative state (B, H, D, D) for O(1) inference.
+                h_prev kept for backward compat with CUDA recurrent scan path.
+        """
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
         cs = self.CHUNK_SIZE
@@ -222,87 +231,97 @@ class CUDAAssociativeLinearAttention(nn.Module):
             k = k.view(B, T, H, D).transpose(1, 2)
             v = v.view(B, T, H, D).transpose(1, 2)
         else:
-            q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)  # (B, H, T, D)
+            q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
             k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
             v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
 
-        # Ensure rotary embedding cache covers current sequence
         end_pos = start_pos + T
         if end_pos > self.rotary.max_seq_len_cached or self.rotary.cos_cached.device != q.device:
             new_len = max(end_pos, self.rotary.max_seq_len_cached * 2)
             self.rotary._build_cache(new_len, device=q.device)
 
-        cos_tab = self.rotary.cos_cached[start_pos:end_pos].to(dtype=q.dtype)  # (T, D)
-        sin_tab = self.rotary.sin_cached[start_pos:end_pos].to(dtype=q.dtype)  # (T, D)
-
-        # 2. Fused RoPE + ELU+1 + Q-scaling
+        cos_tab = self.rotary.cos_cached[start_pos:end_pos].to(dtype=q.dtype)
+        sin_tab = self.rotary.sin_cached[start_pos:end_pos].to(dtype=q.dtype)
         q_rot, k_rot = FusedRoPEELUFunction.apply(q.contiguous(), k.contiguous(), cos_tab, sin_tab)
 
-        # 3. Decay factors
-        log_g = torch.log(torch.sigmoid(self.gamma_raw))  # (H,)
-        decay_mat = torch.exp(log_g.view(H, 1, 1) * self._diff_clamp) * self._causal  # (H, cs, cs)
-        gamma_cross = torch.exp(log_g.view(H, 1) * self._i_idx_p1)                    # (H, cs)
-        gw = torch.exp(log_g.view(H, 1) * self._c_m1_m_i)                              # (H, cs)
-        gamma_c = torch.exp(log_g * cs)                                                # (H,)
+        log_g = torch.log(torch.sigmoid(self.gamma_raw))
 
-        # Path A: Standard full-chunk batched execution (T % cs == 0 and T >= cs)
+        # ------------------------------------------------------------------
+        # O(1) INFERENCE PATH  (s_prev provided — single-token generation)
+        # ------------------------------------------------------------------
+        if s_prev is not None:
+            gamma = torch.sigmoid(self.gamma_raw).to(dtype=x.dtype)
+            state = s_prev
+            outputs = []
+            for t in range(T):
+                q_t = q_rot[:, :, t, :]
+                k_t = k_rot[:, :, t, :]
+                v_t = v[:, :, t, :]
+                kv    = torch.einsum('bhd,bhe->bhde', v_t, k_t)
+                state = gamma.view(1, H, 1, 1) * state + kv
+                z_t   = torch.einsum('bhde,bhe->bhd', state, q_t)
+                outputs.append(z_t.unsqueeze(2))
+            out_h = torch.cat(outputs, dim=2)
+            out   = out_h.transpose(1, 2).contiguous().view(B, T, C)
+            return self.out_proj(out), state
+
+        # ------------------------------------------------------------------
+        # TRAINING / PREFILL — Path A: full-chunk batched
+        # ------------------------------------------------------------------
+        decay_mat   = torch.exp(log_g.view(H, 1, 1) * self._diff_clamp) * self._causal
+        gamma_cross = torch.exp(log_g.view(H, 1) * self._i_idx_p1)
+        gw          = torch.exp(log_g.view(H, 1) * self._c_m1_m_i)
+        gamma_c     = torch.exp(log_g * cs)
+
         if T % cs == 0 and T >= cs:
             num_chunks = T // cs
-            # Reshape to (B * H * num_chunks, cs, D)
             q_chunks = q_rot.view(B, H, num_chunks, cs, D).permute(0, 1, 2, 3, 4).reshape(B * H * num_chunks, cs, D)
             k_chunks = k_rot.view(B, H, num_chunks, cs, D).permute(0, 1, 2, 3, 4).reshape(B * H * num_chunks, cs, D)
             v_chunks = v.view(B, H, num_chunks, cs, D).permute(0, 1, 2, 3, 4).reshape(B * H * num_chunks, cs, D)
 
-            # Intra-chunk attention: (B*H*Nc, cs, D) @ (B*H*Nc, D, cs) -> (B*H*Nc, cs, cs)
-            raw = torch.bmm(q_chunks, k_chunks.transpose(1, 2)).view(B, H, num_chunks, cs, cs)
-            scores = (raw * decay_mat.view(1, H, 1, cs, cs).to(dtype=raw.dtype)).view(B * H * num_chunks, cs, cs)
+            raw      = torch.bmm(q_chunks, k_chunks.transpose(1, 2)).view(B, H, num_chunks, cs, cs)
+            scores   = (raw * decay_mat.view(1, H, 1, cs, cs).to(dtype=raw.dtype)).view(B * H * num_chunks, cs, cs)
             intra_out = torch.bmm(scores, v_chunks).view(B, H, num_chunks, cs, D)
 
-            # Chunk delta_S: v_w^T @ k
-            v_w = (v_chunks.view(B, H, num_chunks, cs, D) * gw.view(1, H, 1, cs, 1).to(dtype=v.dtype)).view(B * H * num_chunks, cs, D)
-            delta_S = torch.bmm(v_w.transpose(1, 2), k_chunks).view(B, H, num_chunks, D, D)
+            v_w      = (v_chunks.view(B, H, num_chunks, cs, D) * gw.view(1, H, 1, cs, 1).to(dtype=v.dtype)).view(B * H * num_chunks, cs, D)
+            delta_S  = torch.bmm(v_w.transpose(1, 2), k_chunks).view(B, H, num_chunks, D, D)
 
-            # Recurrent state scan
             all_states, h_last = RecurrentChunkStateScanFunction.apply(delta_S, gamma_c, h_prev)
+            s_final = h_last  # final accumulated state after all chunks
 
-            # Cross-chunk attention: q @ state^T -> raw_cross
-            raw_cross = torch.bmm(
-                q_chunks,
-                all_states.view(B * H * num_chunks, D, D).transpose(1, 2)
-            ).view(B, H, num_chunks, cs, D)
-            cross_out = raw_cross * gamma_cross.view(1, H, 1, cs, 1).to(dtype=raw_cross.dtype)
+            raw_cross  = torch.bmm(q_chunks, all_states.view(B * H * num_chunks, D, D).transpose(1, 2)).view(B, H, num_chunks, cs, D)
+            cross_out  = raw_cross * gamma_cross.view(1, H, 1, cs, 1).to(dtype=raw_cross.dtype)
 
             total_out = (intra_out + cross_out).permute(0, 2, 3, 1, 4).reshape(B, T, C)
-            return self.out_proj(total_out)
+            return self.out_proj(total_out), s_final
 
-        # Path B: Arbitrary sequence length (e.g. T < cs or T % cs != 0)
-        # Executes chunk loop exactly matching reference semantics for edge cases
+        # Path B: arbitrary T
         state = h_prev.clone() if h_prev is not None else torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
         outputs = []
 
         for start in range(0, T, cs):
             end = min(start + cs, T)
-            c = end - start
+            c   = end - start
             q_c = q_rot[:, :, start:end, :]
             k_c = k_rot[:, :, start:end, :]
             v_c = v[:, :, start:end, :]
 
             if c == cs:
-                dm = decay_mat
+                dm   = decay_mat
                 gc_c = gamma_cross
                 gw_c = gw
                 gc_s = gamma_c.view(1, H, 1, 1)
             else:
-                i_c = self._i_idx[:c]
-                diff_c = (i_c.unsqueeze(1) - i_c.unsqueeze(0)).clamp(min=0)
+                i_c      = self._i_idx[:c]
+                diff_c   = (i_c.unsqueeze(1) - i_c.unsqueeze(0)).clamp(min=0)
                 causal_c = (i_c.unsqueeze(1) - i_c.unsqueeze(0) >= 0).float()
-                dm = torch.exp(log_g.view(H, 1, 1) * diff_c) * causal_c
-                gc_c = torch.exp(log_g.view(H, 1) * (i_c + 1))
-                gw_c = torch.exp(log_g.view(H, 1) * (c - 1 - i_c))
-                gc_s = torch.exp(log_g * c).view(1, H, 1, 1)
+                dm       = torch.exp(log_g.view(H, 1, 1) * diff_c) * causal_c
+                gc_c     = torch.exp(log_g.view(H, 1) * (i_c + 1))
+                gw_c     = torch.exp(log_g.view(H, 1) * (c - 1 - i_c))
+                gc_s     = torch.exp(log_g * c).view(1, H, 1, 1)
 
-            raw = torch.einsum('bhid,bhjd->bhij', q_c, k_c)
-            scores = raw * dm.unsqueeze(0).to(dtype=raw.dtype)
+            raw       = torch.einsum('bhid,bhjd->bhij', q_c, k_c)
+            scores    = raw * dm.unsqueeze(0).to(dtype=raw.dtype)
             intra_out = torch.einsum('bhij,bhjd->bhid', scores, v_c)
 
             raw_cross = torch.einsum('bhde,bhie->bhid', state, q_c)
@@ -310,9 +329,10 @@ class CUDAAssociativeLinearAttention(nn.Module):
 
             outputs.append(intra_out + cross_out)
 
-            v_w = v_c * gw_c.unsqueeze(0).unsqueeze(-1).to(dtype=v_c.dtype)
+            v_w       = v_c * gw_c.unsqueeze(0).unsqueeze(-1).to(dtype=v_c.dtype)
             chunk_upd = torch.einsum('bhid,bhie->bhde', v_w, k_c)
-            state = gc_s * state + chunk_upd
+            state     = gc_s * state + chunk_upd
 
         out = torch.cat(outputs, dim=2).transpose(1, 2).contiguous().view(B, T, C)
-        return self.out_proj(out)
+        return self.out_proj(out), state
+

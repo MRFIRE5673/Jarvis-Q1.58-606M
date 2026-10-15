@@ -41,6 +41,9 @@ struct CublasLtEngine {
     bool fp8_bwd = false;   // route eligible backward GEMMs (gemm_nn/gemm_tn) through FP8 (E5M2 grads)
     void gemm_fp8_ex(int M, int N, int K, const bf16* X, const bf16* W, bf16* Y,
                      bool xT, bool wT, bool grad, float beta, cudaStream_t s) const;
+    // Use pre-quantized weight (skip weight amax+cast). d_inv_w is device ptr to inverse scale.
+    void gemm_fp8_cached(int M, int N, int K, const bf16* X, const uint8_t* W_q8,
+                         const float* d_inv_w, bf16* Y, cudaStream_t s) const;
 
     // GemmDesc members (kept for API compatibility)
     GemmDesc d_qkv_fwd;

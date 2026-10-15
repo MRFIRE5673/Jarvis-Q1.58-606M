@@ -48,6 +48,13 @@ if _TRITON_STE_AVAILABLE:
     class FusedTernaryQuantizeSTE(torch.autograd.Function):
         @staticmethod
         def forward(ctx, w):
+            if not w.is_cuda:
+                alpha = w.abs().mean().clamp(min=1e-8)
+                w_norm = w / alpha
+                w_q = torch.round(torch.clamp(w_norm, -1.0, 1.0))
+                ctx.save_for_backward(w)
+                return w_q * alpha
+
             alpha = w.abs().mean().clamp(min=1e-8)
             wq = torch.empty_like(w)
             N = w.numel()
@@ -64,6 +71,10 @@ if _TRITON_STE_AVAILABLE:
         @staticmethod
         def backward(ctx, grad_output):
             w, = ctx.saved_tensors
+            if not w.is_cuda:
+                mask = (w.abs() <= 1.0).to(dtype=grad_output.dtype)
+                return grad_output * mask
+
             grad_w = torch.empty_like(w)
             N = w.numel()
             BLOCK_SIZE = 1024
@@ -149,3 +160,26 @@ class FusedQKVLinear(nn.Module):
     def forward(self, x):
         w_q = FusedQKVSTE.apply(self.weight)
         return F.linear(x, w_q)
+
+
+# Optimized batched MoE computation using grouped GEMM
+class BatchedTernaryExpert(nn.Module):
+    """Batched ternary expert computation for MoE - processes all experts in parallel."""
+    def __init__(self, d_model, hidden_dim, num_experts):
+        super().__init__()
+        self.num_experts = num_experts
+        # Stacked weights for batched GEMM: (E, hidden, d_model) and (E, d_model, hidden)
+        self.w1 = nn.Parameter(torch.empty(num_experts, hidden_dim, d_model))
+        self.w2 = nn.Parameter(torch.empty(num_experts, d_model, hidden_dim))
+        nn.init.kaiming_uniform_(self.w1, a=5 ** 0.5)
+        nn.init.kaiming_uniform_(self.w2, a=5 ** 0.5)
+        
+    def forward(self, x, expert_indices, gates):
+        """
+        x: (N*K, C) - input tokens
+        expert_indices: (N*K,) - which expert each token goes to
+        gates: (N*K,) - gate values
+        """
+        # For now, use the existing per-expert loop but with optimized batching
+        # A full grouped GEMM implementation would require custom CUDA kernels
+        raise NotImplementedError("Use SparseMoELayer for now - this is a placeholder for future optimization")

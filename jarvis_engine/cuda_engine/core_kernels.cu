@@ -234,20 +234,59 @@ __global__ void scan16_k(const bf16* A, int sA, const bf16* Bv, int sB, const bf
     int u = ub * 8 + (t32 >> 2);
     int ws = (t32 & 3) * 16;
     float g = expf(log_gamma[h]);
-    float X[16];
-    #pragma unroll
-    for (int j = 0; j < 16; ++j) X[j] = 0.f;
+    
+    // Use registers for X[16] - unrolled loop
+    float X0=0, X1=0, X2=0, X3=0, X4=0, X5=0, X6=0, X7=0;
+    float X8=0, X9=0, X10=0, X11=0, X12=0, X13=0, X14=0, X15=0;
+    
     #pragma unroll 2
     for (int i = 0; i < T; ++i) {
         int t = reverse ? (T - 1 - i) : i;
         size_t tok = (size_t)b * T + t;
         float a = bf2f(A[tok * sA + h * D + u]);
-        float bb[16], cc[16];
-        unpack16(Bv + tok * sB + h * D + ws, bb);
-        unpack16(Cv + tok * sC + h * D + ws, cc);
-        float acc = 0.f;
-        #pragma unroll
-        for (int j = 0; j < 16; ++j) { X[j] = g * X[j] + a * bb[j]; acc += X[j] * cc[j]; }
+        
+        // Load 16 elements using vectorized loads
+        float bb0, bb1, bb2, bb3, bb4, bb5, bb6, bb7;
+        float bb8, bb9, bb10, bb11, bb12, bb13, bb14, bb15;
+        float cc0, cc1, cc2, cc3, cc4, cc5, cc6, cc7;
+        float cc8, cc9, cc10, cc11, cc12, cc13, cc14, cc15;
+        
+        // Use uint4 for coalesced 128-bit loads
+        uint4 bv0 = reinterpret_cast<const uint4*>(Bv + tok * sB + h * D + ws)[0];
+        uint4 bv1 = reinterpret_cast<const uint4*>(Bv + tok * sB + h * D + ws + 8)[0];
+        uint4 cv0 = reinterpret_cast<const uint4*>(Cv + tok * sC + h * D + ws)[0];
+        uint4 cv1 = reinterpret_cast<const uint4*>(Cv + tok * sC + h * D + ws + 8)[0];
+        
+        const bf16* ba = reinterpret_cast<const bf16*>(&bv0);
+        const bf16* bb = reinterpret_cast<const bf16*>(&bv1);
+        const bf16* ca = reinterpret_cast<const bf16*>(&cv0);
+        const bf16* cb = reinterpret_cast<const bf16*>(&cv1);
+        
+        bb0 = bf2f(ba[0]); bb1 = bf2f(ba[1]); bb2 = bf2f(ba[2]); bb3 = bf2f(ba[3]);
+        bb4 = bf2f(ba[4]); bb5 = bf2f(ba[5]); bb6 = bf2f(ba[6]); bb7 = bf2f(ba[7]);
+        bb8 = bf2f(bb[0]); bb9 = bf2f(bb[1]); bb10 = bf2f(bb[2]); bb11 = bf2f(bb[3]);
+        bb12 = bf2f(bb[4]); bb13 = bf2f(bb[5]); bb14 = bf2f(bb[6]); bb15 = bf2f(bb[7]);
+        
+        cc0 = bf2f(ca[0]); cc1 = bf2f(ca[1]); cc2 = bf2f(ca[2]); cc3 = bf2f(ca[3]);
+        cc4 = bf2f(ca[4]); cc5 = bf2f(ca[5]); cc6 = bf2f(ca[6]); cc7 = bf2f(ca[7]);
+        cc8 = bf2f(cb[0]); cc9 = bf2f(cb[1]); cc10 = bf2f(cb[2]); cc11 = bf2f(cb[3]);
+        cc12 = bf2f(cb[4]); cc13 = bf2f(cb[5]); cc14 = bf2f(cb[6]); cc15 = bf2f(cb[7]);
+        
+        // Recurrence with manual unrolling for ILP
+        X0 = g * X0 + a * bb0;  X1 = g * X1 + a * bb1;
+        X2 = g * X2 + a * bb2;  X3 = g * X3 + a * bb3;
+        X4 = g * X4 + a * bb4;  X5 = g * X5 + a * bb5;
+        X6 = g * X6 + a * bb6;  X7 = g * X7 + a * bb7;
+        X8 = g * X8 + a * bb8;  X9 = g * X9 + a * bb9;
+        X10 = g * X10 + a * bb10; X11 = g * X11 + a * bb11;
+        X12 = g * X12 + a * bb12; X13 = g * X13 + a * bb13;
+        X14 = g * X14 + a * bb14; X15 = g * X15 + a * bb15;
+        
+        float acc = X0*cc0 + X1*cc1 + X2*cc2 + X3*cc3 +
+                    X4*cc4 + X5*cc5 + X6*cc6 + X7*cc7 +
+                    X8*cc8 + X9*cc9 + X10*cc10 + X11*cc11 +
+                    X12*cc12 + X13*cc13 + X14*cc14 + X15*cc15;
+        
         acc += __shfl_xor_sync(0xffffffff, acc, 1);
         acc += __shfl_xor_sync(0xffffffff, acc, 2);
         if ((t32 & 3) == 0) out[tok * sO + h * D + u] = f2bf(acc);

@@ -21,6 +21,13 @@ import torch
 import torch.nn.functional as F
 import tiktoken
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # Ensure repo paths are in sys.path
 WORKSPACE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 JARVIS_ENGINE_PATH = os.path.join(WORKSPACE_ROOT, "jarvis_engine")
@@ -35,7 +42,7 @@ from jarvis_model import Jarvis
 
 
 def resolve_path(path_arg, default_name=None):
-    """Resolves relative file paths whether running from root or jarvis_engine/."""
+    """Resolves relative file paths whether running from root, data/, or jarvis_engine/."""
     if path_arg and os.path.exists(path_arg):
         return os.path.abspath(path_arg)
     candidates = []
@@ -43,10 +50,12 @@ def resolve_path(path_arg, default_name=None):
         candidates.append(path_arg)
         candidates.append(os.path.join(JARVIS_ENGINE_PATH, path_arg))
         candidates.append(os.path.join(WORKSPACE_ROOT, path_arg))
+        candidates.append(os.path.join(WORKSPACE_ROOT, "data", path_arg))
     if default_name:
         candidates.append(default_name)
         candidates.append(os.path.join(JARVIS_ENGINE_PATH, default_name))
         candidates.append(os.path.join(WORKSPACE_ROOT, default_name))
+        candidates.append(os.path.join(WORKSPACE_ROOT, "data", default_name))
     for c in candidates:
         if os.path.exists(c):
             return os.path.abspath(c)
@@ -68,8 +77,8 @@ def parse_args():
                         help="Top-k filtering threshold (default: 50, <=0 to disable)")
     parser.add_argument("--top_p", type=float, default=0.9,
                         help="Nucleus top-p filtering threshold (default: 0.9, 1.0 to disable)")
-    parser.add_argument("--ckpt", type=str, default="ckpt_step_0004209.pt",
-                        help="Path to model checkpoint")
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Path to model checkpoint (optional)")
 
     # Quantitative corpus evaluation arguments
     parser.add_argument("--eval-file", type=str, default="fresh_holdout.txt",
@@ -89,13 +98,71 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_jarvis_model(ckpt_path, device="cuda"):
-    resolved_ckpt = resolve_path(ckpt_path, "ckpt_step_0004209.pt")
-    if not os.path.exists(resolved_ckpt):
-        raise FileNotFoundError(f"Checkpoint file '{ckpt_path}' not found (searched '{resolved_ckpt}').")
+def load_binary_ckpt(resolved_ckpt, model, device="cuda"):
+    import struct, numpy as np
+    with open(resolved_ckpt, "rb") as f:
+        step = struct.unpack("i", f.read(4))[0]
+        Vp, C, L, E, hi, H = 50304, 1024, 24, 4, 2048, 16
+        def read_tensor(shape):
+            n = 1
+            for s in shape: n *= s
+            data = np.frombuffer(f.read(n * 4), dtype=np.float32).copy().reshape(shape)
+            return torch.from_numpy(data)
+
+        tok_emb = read_tensor((Vp, C))[:50257]
+        final_norm = read_tensor((C,))
+
+        model.tok_emb.weight.data.copy_(tok_emb.to(device=device, dtype=model.tok_emb.weight.dtype))
+        model.lm_head.weight.data.copy_(tok_emb.to(device=device, dtype=model.lm_head.weight.dtype))
+        model.final_norm.weight.data.copy_(final_norm.to(device=device, dtype=model.final_norm.weight.dtype))
+
+        for l in range(L):
+            qkv = read_tensor((3 * C, C))
+            out = read_tensor((C, C))
+            w1 = read_tensor((E * hi, C))
+            w2 = read_tensor((E * C, hi))
+            norm1 = read_tensor((C,))
+            norm2 = read_tensor((C,))
+            gamma = read_tensor((H,))
+
+            b = model.blocks[l]
+            b.norm1.weight.data.copy_(norm1.to(device=device, dtype=b.norm1.weight.dtype))
+            b.norm2.weight.data.copy_(norm2.to(device=device, dtype=b.norm2.weight.dtype))
+            b.attn.gamma_raw.data.copy_(gamma.to(device=device, dtype=b.attn.gamma_raw.dtype))
+            if hasattr(b.attn, "q_proj"):
+                b.attn.q_proj.weight.data.copy_(qkv[:C].to(device=device, dtype=b.attn.q_proj.weight.dtype))
+                b.attn.k_proj.weight.data.copy_(qkv[C:2*C].to(device=device, dtype=b.attn.k_proj.weight.dtype))
+                b.attn.v_proj.weight.data.copy_(qkv[2*C:].to(device=device, dtype=b.attn.v_proj.weight.dtype))
+            elif hasattr(b.attn, "qkv_proj"):
+                b.attn.qkv_proj.weight.data.copy_(qkv.to(device=device, dtype=b.attn.qkv_proj.weight.dtype))
+            b.attn.out_proj.weight.data.copy_(out.to(device=device, dtype=b.attn.out_proj.weight.dtype))
+
+            for e in range(E):
+                b.moe.w1[e].weight.data.copy_(w1[e*hi:(e+1)*hi].to(device=device, dtype=b.moe.w1[e].weight.dtype))
+                b.moe.w2[e].weight.data.copy_(w2[e*C:(e+1)*C].to(device=device, dtype=b.moe.w2[e].weight.dtype))
+
+        rem = f.read()
+        if len(rem) >= L * E * C * 4:
+            r_data = np.frombuffer(rem[:L * E * C * 4], dtype=np.float32).copy().reshape((L, E, C))
+            for l in range(L):
+                model.blocks[l].moe.router.weight.data.copy_(torch.from_numpy(r_data[l]).to(device=device, dtype=model.blocks[l].moe.router.weight.dtype))
+    return step
+
+
+def load_jarvis_model(ckpt_path=None, device="cuda"):
+    resolved_ckpt = None
+    if ckpt_path and os.path.exists(ckpt_path):
+        resolved_ckpt = os.path.abspath(ckpt_path)
+    else:
+        for candidate in [ckpt_path, "ckpt_step_0004209.pt", "data/jarvis_cuda.ckpt", "data/ckpt_step_0004209.pt"]:
+            if candidate:
+                c = resolve_path(candidate)
+                if c and os.path.exists(c):
+                    resolved_ckpt = c
+                    break
 
     print("=" * 80)
-    print("                    LOADING PRODUCTION JARVIS MODEL                     ")
+    print("                    JARVIS 606M MODEL INITIALIZATION                    ")
     print("=" * 80)
     model = Jarvis(
         vocab_size=50257,
@@ -111,16 +178,27 @@ def load_jarvis_model(ckpt_path, device="cuda"):
 
     n_params, param_str = model.param_count()
     print(f"Model Architecture: 606M Jarvis ({n_params:,} parameters, {param_str})")
-    print(f"Loading checkpoint from: {resolved_ckpt}...")
-    ckpt = torch.load(resolved_ckpt, map_location="cpu", weights_only=False)
-    state_dict = ckpt["model_state_dict"]
-    new_state_dict = {k.replace("_orig_mod.", "", 1) if k.startswith("_orig_mod.") else k: v
-                      for k, v in state_dict.items()}
-    missing, unexpected = model.load_state_dict(new_state_dict, strict=True)
-    assert len(missing) == 0 and len(unexpected) == 0, f"Checkpoint mismatch: missing={missing}, unexpected={unexpected}"
 
-    trained_step = ckpt.get("step", "unknown")
-    print(f"Checkpoint loaded successfully: strict=True verified (trained step: {trained_step})")
+    if resolved_ckpt and os.path.exists(resolved_ckpt):
+        print(f"Loading checkpoint from: {resolved_ckpt}...")
+        if resolved_ckpt.endswith(".ckpt"):
+            trained_step = load_binary_ckpt(resolved_ckpt, model, device=device)
+            print(f"Native binary checkpoint loaded successfully (step: {trained_step})")
+        else:
+            ckpt = torch.load(resolved_ckpt, map_location="cpu", weights_only=False)
+            state_dict = ckpt["model_state_dict"]
+            new_state_dict = {k.replace("_orig_mod.", "", 1) if k.startswith("_orig_mod.") else k: v
+                              for k, v in state_dict.items()}
+            missing, unexpected = model.load_state_dict(new_state_dict, strict=True)
+            assert len(missing) == 0 and len(unexpected) == 0, f"Checkpoint mismatch: missing={missing}, unexpected={unexpected}"
+            trained_step = ckpt.get("step", "unknown")
+            print(f"PyTorch checkpoint loaded successfully: strict=True verified (step: {trained_step})")
+            del ckpt, state_dict, new_state_dict
+    else:
+        trained_step = 0
+        resolved_ckpt = "None (untrained / fresh weights)"
+        print("[Notice] No checkpoint found. Model initialized with random weights.")
+        print("         To train the model on tokens, use Option 7 in start.bat.")
 
     status = model.get_backend_status()
     device_name = torch.cuda.get_device_name(0) if device == "cuda" else "CPU"
@@ -130,7 +208,6 @@ def load_jarvis_model(ckpt_path, device="cuda"):
     print(f"Inference Dtype:    torch.bfloat16 (with native FP32 accumulations)")
     print("=" * 80 + "\n")
 
-    del ckpt, state_dict, new_state_dict
     torch.cuda.empty_cache()
     model.eval()
     return model, resolved_ckpt, trained_step
@@ -155,8 +232,16 @@ def print_model_info(model, ckpt_path, device="cuda"):
     print("----------------------------------\n")
 
 
-def sample_next_token(logits, temperature=0.7, top_k=50, top_p=0.9):
+def sample_next_token(logits, temperature=0.7, top_k=50, top_p=0.9, repetition_penalty=1.15, prev_tokens=None):
     """Samples next token with temperature, top-k, and nucleus top-p filtering."""
+    if prev_tokens is not None and repetition_penalty > 1.0:
+        for t in set(prev_tokens):
+            if t < logits.size(-1):
+                if logits[0, t] > 0:
+                    logits[0, t] /= repetition_penalty
+                else:
+                    logits[0, t] *= repetition_penalty
+
     if temperature is None or temperature <= 0.0:
         return torch.argmax(logits, dim=-1, keepdim=True)
 
@@ -194,21 +279,33 @@ def generate_streaming(
     temperature: float = 0.7,
     top_k: int = 50,
     top_p: float = 0.9,
+    repetition_penalty: float = 1.15,
     device: str = "cuda"
 ):
     """
-    Generates text autoregressively and streams tokens to stdout in real-time.
-    Resets model state before generation to prevent state leakage.
-    Measures synchronized timing for accurate tok/s calculation.
+    O(1) per-token streaming inference using associative state caching.
+
+    Phase 5 implementation:
+      1. Reset all recurrent states (H and S).
+      2. Prefill the prompt context in one parallel forward pass (persist_state=True).
+      3. Autoregressively generate one token at a time — each step feeds only the
+         single new token and carries S_t and H_t forward. No sliding-window recompute.
     """
     model.eval()
-    # Reset model state before prompt execution to prevent cross-prompt state pollution
     model.reset_state()
 
     prompt_ids = enc.encode(prompt_text)
     if len(prompt_ids) == 0:
         prompt_ids = [enc.eot_token]
-    curr_tokens = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
+
+    # --- Prefill: process full prompt in one shot, cache recurrent state ---
+    context = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        logits, _ = model(context, persist_state=True)
+    # seed: last token of prompt gives first generation logit
+    next_logits = logits[:, -1, :].float()
+    next_tok = sample_next_token(next_logits, temperature=temperature, top_k=top_k, top_p=top_p,
+                                 repetition_penalty=repetition_penalty, prev_tokens=prompt_ids)
 
     generated_token_ids = []
     prev_decoded_len = 0
@@ -218,29 +315,30 @@ def generate_streaming(
     t_start = time.perf_counter()
 
     for step_idx in range(max_new_tokens):
-        # Jarvis sliding context window (supports sequence lengths up to 256)
-        context = curr_tokens[:, -256:] if curr_tokens.size(1) > 256 else curr_tokens
-
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            logits, _ = model(context, persist_state=False)
-
-        next_logits = logits[:, -1, :].float()
-        next_tok = sample_next_token(next_logits, temperature=temperature, top_k=top_k, top_p=top_p)
         tok_id = next_tok.item()
-
-        # Check for EOS token
         if tok_id == enc.eot_token:
             break
 
         generated_token_ids.append(tok_id)
-        curr_tokens = torch.cat([curr_tokens, next_tok], dim=1)
 
-        # Stream decoded token delta to stdout
+        # Stream decoded token delta
         full_gen_text = enc.decode(generated_token_ids)
         new_text = full_gen_text[prev_decoded_len:]
-        sys.stdout.write(new_text)
-        sys.stdout.flush()
+        try:
+            sys.stdout.write(new_text)
+            sys.stdout.flush()
+        except Exception:
+            sys.stdout.write(new_text.encode("utf-8", errors="replace").decode("utf-8", errors="replace"))
+            sys.stdout.flush()
         prev_decoded_len = len(full_gen_text)
+
+        # O(1) single-token forward: feeds only the new token, S_t and H_t carried
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            logits, _ = model(next_tok, persist_state=True)
+        next_logits = logits[:, -1, :].float()
+        seen = prompt_ids + generated_token_ids
+        next_tok = sample_next_token(next_logits, temperature=temperature, top_k=top_k, top_p=top_p,
+                                     repetition_penalty=repetition_penalty, prev_tokens=seen)
 
     torch.cuda.synchronize()
     t_end = time.perf_counter()
@@ -263,7 +361,7 @@ def generate_streaming(
     print("-" * 50)
     print(f"Tokens Generated:  {n_tokens}")
     print(f"Generation Time:   {duration:.3f} s")
-    print(f"Throughput:        {tok_s:.1f} tok/s")
+    print(f"Throughput:        {tok_s:.1f} tok/s  [Phase 5: O(1) state cache]")
     print(f"Peak VRAM:         {peak_vram:.2f} GB")
     print("-" * 50)
 

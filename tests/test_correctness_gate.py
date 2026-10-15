@@ -50,7 +50,20 @@ def run_correctness_gate():
     ).to(device)
 
     # Sync weights to exact parity
-    m_ref.load_state_dict(m_cuda.state_dict())
+    sd_cuda = m_cuda.state_dict()
+    sd_ref = {}
+    for k, v in sd_cuda.items():
+        if ".attn.q_proj.weight" in k:
+            prefix = k.replace(".attn.q_proj.weight", "")
+            q = sd_cuda[f"{prefix}.attn.q_proj.weight"]
+            k_w = sd_cuda[f"{prefix}.attn.k_proj.weight"]
+            v_w = sd_cuda[f"{prefix}.attn.v_proj.weight"]
+            sd_ref[f"{prefix}.attn.qkv_proj.weight"] = torch.cat([q, k_w, v_w], dim=0)
+        elif ".attn.k_proj.weight" in k or ".attn.v_proj.weight" in k:
+            continue
+        else:
+            sd_ref[k] = v
+    m_ref.load_state_dict(sd_ref)
 
     x = torch.randint(0, 50257, (2, 64), device=device)
     y = torch.randint(0, 50257, (2, 64), device=device)
@@ -120,8 +133,8 @@ def run_correctness_gate():
     x_pert[0, -1] += 5.0
     with torch.no_grad():
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            o_base = attn_layer(x_base)
-            o_pert = attn_layer(x_pert)
+            o_base, _ = attn_layer(x_base)
+            o_pert, _ = attn_layer(x_pert)
     attn_causal_diff = (o_base[:, :-1, :] - o_pert[:, :-1, :]).abs().max().item()
     print(f"  [Gate 3a] Attention Temporal Isolation Deviation: {attn_causal_diff:.8f}")
     assert attn_causal_diff == 0.0, f"Attention causality broken! Diff: {attn_causal_diff}"

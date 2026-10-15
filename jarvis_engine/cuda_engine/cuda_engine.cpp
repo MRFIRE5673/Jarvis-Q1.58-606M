@@ -233,6 +233,26 @@ void alloc_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     dev_alloc_fp32(&ws.stash_rsqrt2, (size_t)8,          "stash_rsqrt2 (unused)");
     dev_alloc_bf16(&ws.stash_h1,     (size_t)E * NT * hi, "stash_h1 scratch [E,NT,hi]");
 
+    // FP8 weight caches (one uint8 byte per element, allocated per-layer)
+    auto alloc_u8_arr = [&](uint8_t**& arr, size_t n_each) {
+        arr = new uint8_t*[L]();
+        for (int l = 0; l < L; ++l) { cudaMalloc(&arr[l], n_each); cudaMemset(arr[l], 0, n_each); }
+    };
+    auto alloc_f1_arr = [&](float**& arr) {
+        arr = new float*[L]();
+        for (int l = 0; l < L; ++l) { cudaMalloc(&arr[l], sizeof(float)); cudaMemset(arr[l], 0, sizeof(float)); }
+    };
+    alloc_u8_arr(ws.qkv_q8, (size_t)3*C*C);
+    alloc_u8_arr(ws.out_q8, (size_t)C*C);
+    alloc_u8_arr(ws.w1_q8,  (size_t)E*hi*C);
+    alloc_u8_arr(ws.w2_q8,  (size_t)E*C*hi);
+    alloc_f1_arr(ws.qkv_inv);
+    alloc_f1_arr(ws.out_inv);
+    alloc_f1_arr(ws.w1_inv);
+    alloc_f1_arr(ws.w2_inv);
+    printf("  [alloc] FP8 weight cache [L,per-layer]         %zu MB\n",
+           ((size_t)3*C*C + C*C + E*hi*C + E*C*hi) * L / 1048576);
+
     // Grad buffers
     dev_alloc_bf16(&ws.d_logits,     (size_t)NT * Vp,    "d_logits");
     dev_alloc_bf16(&ws.d_x,          (size_t)NT * C,     "d_x");
@@ -302,6 +322,26 @@ void free_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     FD(ws.logits);    FD(ws.loss);
     FD(ws.stash_x);   FD(ws.stash_x2);
     FD(ws.stash_rsqrt1); FD(ws.stash_rsqrt2); FD(ws.stash_h1);
+
+    auto fl_u8 = [&](uint8_t** arr) {
+        if (!arr) return;
+        for (int l = 0; l < L; ++l) if (arr[l]) cudaFree(arr[l]);
+        delete[] arr;
+    };
+    auto fl_bf16 = [&](bf16** arr) {
+        if (!arr) return;
+        for (int l = 0; l < L; ++l) if (arr[l]) cudaFree(arr[l]);
+        delete[] arr;
+    };
+    auto fl_fp32 = [&](float** arr) {
+        if (!arr) return;
+        for (int l = 0; l < L; ++l) if (arr[l]) cudaFree(arr[l]);
+        delete[] arr;
+    };
+
+    // FP8 weight caches
+    fl_u8(ws.qkv_q8); fl_u8(ws.out_q8); fl_u8(ws.w1_q8); fl_u8(ws.w2_q8);
+    fl_fp32(ws.qkv_inv); fl_fp32(ws.out_inv); fl_fp32(ws.w1_inv); fl_fp32(ws.w2_inv);
     FD(ws.d_logits);  FD(ws.d_x);    FD(ws.d_norm1);
     FD(ws.d_qkv);     FD(ws.d_attn_out); FD(ws.d_norm2);
     FD(ws.d_moe);     FD(ws.d_dispatch); FD(ws.d_h1);
@@ -314,17 +354,6 @@ void free_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     FD(ws.d_clip_coef);
 
     #undef FD
-
-    auto fl_bf16 = [&](bf16** arr) {
-        if (!arr) return;
-        for (int l = 0; l < L; ++l) if (arr[l]) cudaFree(arr[l]);
-        delete[] arr;
-    };
-    auto fl_fp32 = [&](float** arr) {
-        if (!arr) return;
-        for (int l = 0; l < L; ++l) if (arr[l]) cudaFree(arr[l]);
-        delete[] arr;
-    };
 
     fl_bf16(ws.d_qkv_w);   fl_bf16(ws.d_out_w);
     fl_bf16(ws.d_exp_w1);  fl_bf16(ws.d_exp_w2);

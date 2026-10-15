@@ -1,89 +1,128 @@
-# Jarvis Q1.58-500M: Sub-Quadratic Ternary Language Model with Recurrent Memory & Sparse MoE
+# Jarvis Q1.58-500M
 
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.1%2B-ee4c2c.svg)](https://pytorch.org/)
-[![CUDA](https://img.shields.io/badge/CUDA-12.0%2B-76b900.svg)](https://developer.nvidia.com/cuda-zone)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-
-**Jarvis Q1.58-500M** is a high-efficiency sub-quadratic language model combining:
-1. **Recurrent Associative Linear Attention:** $O(1)$ constant-memory autoregressive decoding and $O(T)$ parallel training via causal cumsum scans.
-2. **Ternary Quantized Weights (1.58-bit):** Ternary parameter representation (\{-1, 0, +1\}) evaluated via Straight-Through Estimators (STE).
-3. **Sparse Mixture-of-Experts (MoE):** 4 experts per layer with top-2 auxiliary-free routing, expanding parameter capacity while bounding active compute per token.
-4. **Liquid State Fusion (LSF):** Continuous-time decaying recurrence capturing multi-timescale sequential dynamics.
+Sub-quadratic 606M language model architecture combining ternary quantization (1.58-bit), chunked associative linear attention with RoPE, top-2 sparse Mixture-of-Experts (MoE), and liquid state fusion.
 
 ---
 
-## Model Capacity & Architecture Specifications
+## Architecture Specifications
 
-Diagnostics verified on the 606M parameter scale:
+Verified parameter counts and architecture dimensions (606M scale):
 
-| Metric | Verified Value | Description |
+| Specification | Value | Description |
 | :--- | :---: | :--- |
-| **Total Parameters** | **606,391,728** | Total model weights (embeddings + 24 blocks + LM head) |
-| **Active Parameters / Token** | **405,014,528** | Active compute per token forward pass (~66.8% active) |
-| **Layer Count** | 24 | Transformer blocks with residual normalization |
+| **Total Parameters** | **606,391,704** | Total model weights (embeddings + 24 blocks + LM head) |
+| **Active Parameters / Token** | **405,065,112** | Active parameters per forward pass (~66.8% active via Top-2 MoE) |
+| **Layers** | 24 | Transformer blocks with residual normalization |
 | **Hidden Dimension ($d_{\text{model}}$)** | 1,024 | Internal representation width |
-| **Attention Heads ($n_{\text{heads}}$)** | 16 | Number of associative attention heads |
-| **Head Dimension ($d_{\text{head}}$)** | 64 | Dimension per attention head |
+| **Attention Heads** | 16 | Associative attention heads (Head Dim: 64) |
 | **Vocabulary Size** | 50,257 | GPT-2 BPE tokenizer vocabulary |
-| **MoE Experts** | 4 | 4 routed experts per layer (top-2 active per token) |
-| **Position Encoding** | RoPE | Rotary Position Embeddings applied post-feature map |
-| **Normalization** | RMSNorm | Root-mean-square layer normalization |
+| **MoE Experts** | 4 | 4 routed experts per layer (Top-2 active per token) |
+| **Weight Quantization** | 1.58-bit | Ternary weights $\{-1, 0, +1\}$ trained via Straight-Through Estimator (STE) |
+| **Attention Mechanism** | Sub-quadratic | Chunked associative linear attention with Rotary Embeddings (RoPE) |
+| **Recurrence** | Hybrid | Constant $O(1)$ memory state carry during autoregressive decoding |
 
 ---
 
-## Paper-Faithful Baseline vs. Research Variants
+## Current Status & Honest Grounding
 
-To maintain scientific integrity, this repository maintains an explicit distinction:
-
-- **Paper-Faithful Baseline:** The original foundational architecture (`jarvis_engine/jarvis_model.py`, checkpoint `ckpt_step_0004209.pt`). Uses scalar decay associative linear attention, Liquid State Fusion, 1.58-bit ternary quantization, and top-2 MoE routing. The paper baseline remains permanently immutable.
-- **Research Variants:** Controlled architectural extensions developed in `experiments/architecture_matrix/` exploring adaptive input-dependent retention, selective write/erase gates, local sliding-window buffers, and activation variants.
-- **Factorial Memory Study:** Staged factorial investigation determining which recurrent memory mechanisms cooperate versus interfere under fixed token and compute budgets.
+- **Architecture & Kernels:** Fully implemented and passing 100% of correctness gates (forward/backward parity, STE gradient flow, causal invariance, state persistence, and numeric stability).
+- **Native CUDA C++ Engine:** Custom cuBLASLt GEMM backend with FP8 cached activations, BF16 inputs, and FP32 accumulation under CUDA Graph capture. Benchmarked at **11,663+ tok/s** on an NVIDIA GeForce RTX 5070 (Blackwell SM120).
+- **Checkpoints & Training:** This repository contains the architecture, CUDA kernels, and training engine. It does **not** ship with a pretrained dialogue model. Weights must be trained via the native training pipeline (`start.bat` Option 7 or `python jarvis_engine/train_cuda.py`). A 606M model requires hundreds of millions to billions of tokens to develop natural English fluency and code synthesis.
 
 ---
 
-## Audited CUDA Acceleration Backends
+## Quickstart Console (`start.bat`)
 
-Jarvis includes custom, audited CUDA C++ extensions with seamless PyTorch CPU/CUDA fallbacks:
-- **`associative_attention_cuda/`:** Fused associative attention forward and backward kernel with exact synchronization and state persistence.
-- **`sparse_model_cuda/`:** High-throughput sparse MoE router and scatter-add expert dispatcher.
-- **`liquid_fusion_cuda/`:** Vectorized continuous-time liquid state causal decay scan.
+Run `start.bat` on Windows to access the interactive menu:
 
-### Benchmark Throughput:
-- **Baseline PyTorch Fallback:** ~504 tok/s
-- **Audited CUDA Acceleration:** ~5,160+ tok/s prefill throughput on an NVIDIA RTX 5070 (12GB sm_120).
-
----
-
-## Interactive Terminal Inference & Evaluation
-
-Jarvis provides a streaming command-line interface for interactive experimentation:
-
-```bash
-# Launch interactive CMD terminal session
-python jarvis_engine/evaluate_jarvis.py --interactive
-
-# Autoregressively stream a single prompt
-python jarvis_engine/evaluate_jarvis.py --prompt "def quicksort(arr):" --max_new_tokens 150
-
-# Quantitative evaluation on genuine holdout dataset
-python jarvis_engine/evaluate_jarvis.py --eval_file fresh_holdout.txt --num_windows 50 --seq_len 512
+```text
+===================================================
+              JARVIS Q1.58 500M CONSOLE
+===================================================
+  1. Agentic AI (Python, CMD, File I/O, GPU execution)
+  2. Raw Chat (Streaming text completion)
+  3. One-shot prompt
+  4. Evaluate (Holdout perplexity)
+  5. Benchmark CUDA engine (tok/s)
+  6. Rebuild CUDA engine (C++/SM120)
+  7. Train 10M tokens (50% English / 50% code)
+  8. Resume training (CUDA graph)
+  9. Exit
+===================================================
 ```
 
 ---
 
-## Research Program & Factorial Matrix
+## Components
 
-For comprehensive details on our ongoing research into advanced recurrent memory mechanisms:
-- **[Research Overview](research/README.md)**
-- **[Pairwise Interaction Matrix](research/interaction_matrix.md)**
-- **[Experimental Methodology & Controls](research/methodology.md)**
-- **[Architectural Decision Records](research/architecture_decisions.md)**
+### 1. Agentic AI Terminal (`jarvis_engine/jarvis_agent.py`)
+Provides local tool execution and reasoning:
+- **`run_python`:** Executes generated Python code in a sandboxed subprocess and returns stdout/stderr.
+- **`run_cmd`:** Runs Windows CLI and shell commands.
+- **`read_file` / `write_file`:** Inspects and modifies files in the workspace.
+- **`gpu_info`:** Queries live NVIDIA VRAM, compute usage, and memory reservations.
 
-### Completed Factorial Memory Snapshot (Controlled 100-step test):
-- **Baseline Holdout Loss:** CE **3.2858** | PPL **26.73**
-- **Top Pair (`B+C`, Write + Erase Gate):** Final CE **3.2882** | PPL **26.79** | Interaction **-0.0109** (Synergistic)
-- **Second Pair (`A+C`, Adaptive Decay + Erase Gate):** Final CE **3.2895** | PPL **26.83** | Interaction **-0.0118** (Synergistic)
-- *Note:* All seven completed pairs exhibit negative interaction coefficients, showing that dynamic gating mechanisms cooperate effectively under neutral initialization.
+Launch via `start.bat` (Option 1) or directly:
+```bash
+python jarvis_engine/jarvis_agent.py
+```
+
+### 2. High-Throughput Native CUDA Engine (`jarvis_engine/cuda_engine/`)
+Custom C++/CUDA training engine with zero Python overhead during execution steps:
+- **cuBLASLt GEMM Engine:** Pre-quantized FP8 weights with interleaved MoE W1 $\to$ GELU $\to$ W2 execution to maximize L2 cache hit rate.
+- **CUDA Graph Capture:** Replays the entire forward, backward, optimizer step, and ternary clipping in a single GPU submission.
+- **Binary Checkpoint Format:** Fast serialization directly to/from native host/device memory.
+
+To build the native CUDA engine:
+```bash
+cd jarvis_engine/cuda_engine
+python build_engine.py
+```
+
+To run the standalone CUDA benchmark:
+```bash
+python jarvis_engine/bench_engine.py
+```
+
+### 3. Data Preparation & Training Pipeline
+- **`jarvis_engine/prepare_data.py`:** Streams and tokenizes multi-domain datasets (50% FineWeb-Edu English + 50% CodeParrot clean Python) into 512-token interleaved blocks (`data/train_tokens.npy`).
+- **`jarvis_engine/train_cuda.py`:** Executes training passes over the token array with live EMA loss, throughput telemetry, and periodic checkpointing.
+
+```bash
+# Tokenize 10M tokens
+python jarvis_engine/prepare_data.py 10000000
+
+# Train with native CUDA engine
+python jarvis_engine/train_cuda.py
+
+# Resume training from existing checkpoint
+python jarvis_engine/train_cuda.py resume
+```
+
+### 4. Interactive Evaluation Suite (`jarvis_engine/evaluate_jarvis.py`)
+- Real-time streaming autoregressive decoding using $O(1)$ associative state caching.
+- Perplexity and decoupled cross-entropy evaluation on holdout corpora.
+
+```bash
+# Streaming interactive session
+python jarvis_engine/evaluate_jarvis.py --interactive
+
+# Single prompt completion
+python jarvis_engine/evaluate_jarvis.py --prompt "def fibonacci(n):" --max_new_tokens 64
+
+# Holdout perplexity evaluation
+python jarvis_engine/evaluate_jarvis.py --eval-file fresh_holdout.txt --num-windows 50
+```
+
+---
+
+## Verification & Correctness Tests
+
+Run the regression suite covering forward/backward parity, STE quantization gradient flow, causal invariance, state persistence, and numeric stability:
+
+```bash
+python tests/test_correctness_gate.py
+```
 
 ---
 
@@ -91,39 +130,24 @@ For comprehensive details on our ongoing research into advanced recurrent memory
 
 ```
 Jarvis-Q1.58-500M/
-├── jarvis_engine/                  # Core production model and runtime
-│   ├── jarvis_model.py             # Paper-faithful 606M architecture
-│   ├── train.py                    # Production training and fine-tuning engine
-│   └── evaluate_jarvis.py          # Interactive terminal and evaluation CLI
-├── associative_attention_cuda/     # Custom CUDA Associative Attention backend
-├── sparse_model_cuda/              # Custom CUDA Sparse MoE backend
-├── liquid_fusion_cuda/             # Custom CUDA Liquid State Fusion backend
-├── runtime/                        # Optimized streaming runtime & scheduler
-├── experiments/                    # Research infrastructure & ablation matrix
-│   ├── architecture_matrix/        # Factorial memory experiments & modular code
-│   │   ├── modular_memory.py       # Modular attention block (A, B, C, D, E)
-│   │   ├── factorial_research_runner.py  # Controlled experiment driver
-│   │   ├── batch_factorial_matrix.py     # Automated factorial queue
-│   │   └── interaction_analyzer.py       # Synergy/antagonism calculator
-│   └── leaderboard.md              # Live experiment leaderboard
-├── research/                       # Scientific documentation & reports
-│   ├── README.md                   # Research hub index
-│   ├── methodology.md              # Controlled experimental protocols
-│   ├── interaction_matrix.md       # Pairwise memory interaction results
-│   └── architecture_decisions.md   # Architectural Decision Records (ADRs)
-├── benchmarks/                     # Hardware and scaling benchmark suites
-└── tests/                          # Rigorous numerical parity & correctness tests
-```
-
----
-
-## Verification & Correctness Testing
-
-Run the full correctness test suite covering forward/backward parity, causal invariance, state persistence, and NaN/Inf stability:
-
-```bash
-python tests/test_correctness_gate.py
-python verify_production_integration.py
+├── jarvis_engine/
+│   ├── jarvis_model.py             # 606M PyTorch model definition (RoPE, MoE, LSF, Ternary)
+│   ├── jarvis_agent.py             # Agentic AI terminal with local tool execution
+│   ├── evaluate_jarvis.py          # Interactive CLI and holdout evaluation
+│   ├── train_cuda.py               # Native CUDA training runner
+│   ├── prepare_data.py             # FineWeb-Edu + CodeParrot tokenization pipeline
+│   ├── bench_engine.py             # Engine speed benchmark script
+│   └── cuda_engine/                # Native C++/CUDA cuBLASLt training engine
+│       ├── build_engine.py         # MSVC/NVCC build script
+│       ├── cublaslt_engine.cu      # Fast cuBLASLt GEMM routines
+│       ├── full_engine.cu          # Fused forward/backward/graph execution
+│       └── core_kernels.cu         # Elementwise, norm, and ternary kernels
+├── associative_attention_cuda/     # PyTorch custom CUDA extension for associative attention
+├── sparse_model_cuda/              # PyTorch custom CUDA extension for sparse MoE
+├── tests/                          # Rigorous numerical parity & correctness gate suites
+├── experiments/                    # Research and ablation scripts
+├── start.bat                       # One-click Windows console launcher
+└── README.md                       # Repository documentation
 ```
 
 ---
