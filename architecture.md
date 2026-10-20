@@ -1,8 +1,8 @@
-# Jarvis-Q1.58-500M: Architecture Specification
+# Jarvis-Q1.58-606M: Architecture Specification
 
 ## 1. Executive Summary
 
-**Jarvis-Q1.58-500M** is a 606-million parameter Neuromorphic Transformer designed to eliminate the quadratic memory and compute bottlenecks of conventional transformers. It combines:
+**Jarvis-Q1.58-606M** is a 606-million parameter Neuromorphic Transformer designed to eliminate the quadratic memory and compute bottlenecks of conventional transformers. It combines:
 
 1. **$O(N)$ Infinite Associative Linear Attention** with learnable per-head recurrent decay.
 2. **Spiking Ternary Weight Quantization ($Q_{1.58}$)** with Straight-Through Estimators (STE).
