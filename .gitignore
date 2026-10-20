@@ -75,4 +75,7 @@ ENV/
 *~
 .DS_Store
 Thumbs.db
-\ndata/train_tokens_300m_en25_code75.npy\ndata/train_tokens_300m_en25_code75.meta\ndata/train_tokens.meta\n
+
+data/train_tokens_300m_en25_code75.npy
+data/train_tokens_300m_en25_code75.meta
+data/train_tokens.meta
