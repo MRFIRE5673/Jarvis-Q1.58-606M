@@ -94,32 +94,20 @@ else:
     cuda_lib = ""
     print("[setup.py] WARNING: CUDA_HOME not found. Build may fail.")
 
-# =============================================================================
-# 3. RELAX PyTorch CUDA VERSION MISMATCH CHECK
-# PyTorch dev build (+cu128) reports cuda 12.8 internally but we use CUDA 13.3.
-# The version check would fail; suppress it.
-# =============================================================================
-_orig_check = getattr(cpp_ext, '_check_cuda_version', None)
-if _orig_check:
-    def _relaxed_check(*a, **kw):
-        try:
-            _orig_check(*a, **kw)
-        except RuntimeError as e:
-            print(f"[setup.py] Suppressed CUDA version mismatch: {e}")
-    cpp_ext._check_cuda_version = _relaxed_check
-
-# Also check for _check_compiler_abi_compatibility
-_orig_abi = getattr(cpp_ext, '_check_compiler_abi_compatibility', None)
-if _orig_abi:
-    def _relaxed_abi(*a, **kw):
-        try:
-            _orig_abi(*a, **kw)
-        except RuntimeError as e:
-            print(f"[setup.py] Suppressed ABI check: {e}")
-    cpp_ext._check_compiler_abi_compatibility = _relaxed_abi
+# CUDA minor-version mismatches can work, but they must be an explicit choice.
+# The default keeps PyTorch's compatibility check intact.
+if os.environ.get("JARVIS_ALLOW_CUDA_MISMATCH") == "1":
+    _check_cuda_version = getattr(cpp_ext, "_check_cuda_version", None)
+    if _check_cuda_version:
+        def _allow_cuda_mismatch(*args, **kwargs):
+            try:
+                _check_cuda_version(*args, **kwargs)
+            except RuntimeError as exc:
+                print(f"[setup.py] CUDA mismatch explicitly allowed: {exc}")
+        cpp_ext._check_cuda_version = _allow_cuda_mismatch
 
 # =============================================================================
-# 4. NVCC FLAGS — SM120 Blackwell exclusive
+# 3. NVCC FLAGS — SM120 Blackwell exclusive
 # No fallback fatbins (sm_80, sm_90, etc.) — 100% native SM120 ISA.
 # =============================================================================
 nvcc_flags = [

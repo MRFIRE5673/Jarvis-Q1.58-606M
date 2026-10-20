@@ -19,8 +19,10 @@ void launch_prepare_optimizer_step(
     float*       d_bc1,
     float*       d_bc2,
     float*       d_clip_coef,
+    float*       d_lr,
     const float* d_grad_norm_sq,
-    float beta1, float beta2, float grad_clip,
+    float beta1, float beta2, float grad_clip, float base_lr,
+    int warmup_steps, int decay_steps, float min_lr_ratio,
     cudaStream_t s
 );
 
@@ -40,6 +42,7 @@ void launch_adamw_fused(
     const float*   d_bc1,
     const float*   d_bc2,
     const float*   d_clip_coef,
+    const float*   d_lr,
     int N, cudaStream_t s
 );
 

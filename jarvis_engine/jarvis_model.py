@@ -848,6 +848,11 @@ class Jarvis(nn.Module):
         B, T = idx.shape
         x = self.tok_emb(idx)
 
+        if persist_state and any(
+            state is not None and state.shape[0] != B
+            for state in (*self._h_states, *self._s_states)
+        ):
+            self.reset_state()
         start_pos = self._token_pos if persist_state else 0
         if persist_state:
             self._token_pos += T

@@ -171,9 +171,11 @@ The repository maintains two synchronized implementations:
 
 * **Micro-Batch Size ($B$):** 4 sequences
 * **Sequence Length ($T$):** 512 tokens
-* **Gradient Accumulation ($accum$):** 2 microsteps per update
-* **Tokens per Optimizer Step:** $4 \times 512 \times 2 = \mathbf{4,096\text{ tokens/update}}$
+* **Gradient Accumulation ($accum$):** 4 microsteps per update
+* **Tokens per Optimizer Step:** $4 \times 512 \times 4 = \mathbf{8,192\text{ tokens/update}}$
+* **Optimizer:** AdamW, $\beta_1=0.9$, $\beta_2=0.999$, weight decay $=0.01$, gradient clip $=1.0$
+* **Learning Rate:** $3\times10^{-4}$ base LR, GPU-resident 3% linear warmup, cosine decay to 10% of base LR
 * **Sustained Latency:** **79.175 ms per update**
-* **Sustained Throughput:** **51,733.7 tokens/sec** (Peak: 52,070 tok/s)
+* **Measured Full-Training Throughput:** **~16,100 tokens/sec** on RTX 5070 with `B=4, T=512, accum=4`; older 51k figures are from a non-comparable timing path.
 * **VRAM Footprint:** 1,166.07 MiB Allocated | 1,186.00 MiB Reserved
 * **Numerical Invariant:** Strict mathematical loss parity ($L_\infty = 0.0000000\text{e}+00$)

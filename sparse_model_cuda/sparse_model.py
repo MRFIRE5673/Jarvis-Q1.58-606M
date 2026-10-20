@@ -377,8 +377,11 @@ class CUDASparseMoELayer(nn.Module):
             if _TRITON_AVAILABLE and x.is_cuda and x.dtype == torch.bfloat16:
                 w1_stacked = torch.stack([self.w1[e].weight for e in range(self.num_experts)])
                 w2_stacked = torch.stack([self.w2[e].weight for e in range(self.num_experts)])
-                w1_q = StackedTernarySTE.apply(w1_stacked)
-                w2_q = StackedTernarySTE.apply(w2_stacked)
+                if getattr(self, "_native_prequantized", False):
+                    w1_q, w2_q = w1_stacked, w2_stacked
+                else:
+                    w1_q = StackedTernarySTE.apply(w1_stacked)
+                    w2_q = StackedTernarySTE.apply(w2_stacked)
                 dispatched_y = TritonGroupedMoEMLPFunction.apply(dispatched_x, w1_q, w2_q, expert_offsets)
             else:
                 dispatched_y = torch.empty_like(dispatched_x)

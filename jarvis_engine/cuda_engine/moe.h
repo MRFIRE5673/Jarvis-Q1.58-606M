@@ -22,14 +22,49 @@
 void launch_top2_gating(
     const __nv_bfloat16* logits, float* probs,
     int* topk_idx, float* topk_gates,
-    int NT, int E, cudaStream_t s
+    int NT, int E, float noise_std, const int* step, int noise_seed, cudaStream_t s
 );
+
+void launch_top2_gating_count(
+    const __nv_bfloat16* logits, float* probs,
+    int* topk_idx, float* topk_gates, int* expert_counts,
+    int NT, int E, float noise_std, const int* step, int noise_seed, cudaStream_t s
+);
+
+void launch_expert_offsets(const int* counts, int* offsets, int E, cudaStream_t s);
 
 // Dispatch gather: x[NT,C] + topk_idx[NT,K] → dispatch_x[NTK,C]
 void launch_dispatch_gather(
     const __nv_bfloat16* x, const int* topk_idx,
     __nv_bfloat16* dispatch_x,
     int NT, int K, int C, cudaStream_t s
+);
+
+// Sparse top-2 dispatch into compact expert-major segments. route_pos records
+// each route's local slot; offsets gives the segment start for each expert.
+void launch_sparse_dispatch(
+    const __nv_bfloat16* x, const int* topk_idx,
+    __nv_bfloat16* dispatch_x, int* route_pos, int* route_write,
+    const int* offsets, int NT, int K, int E, int C, cudaStream_t s
+);
+
+void launch_sparse_dispatch_cached(
+    const __nv_bfloat16* x, const int* topk_idx, const int* route_pos,
+    __nv_bfloat16* dispatch_x, const int* offsets,
+    int NT, int K, int C, cudaStream_t s
+);
+
+void launch_sparse_combine_fwd(
+    const __nv_bfloat16* expert_out, const __nv_bfloat16* x_residual,
+    const int* topk_idx, const int* route_pos, const int* offsets,
+    const float* topk_gates, __nv_bfloat16* moe_out,
+    int NT, int K, int C, cudaStream_t s
+);
+
+void launch_sparse_combine_bwd(
+    const __nv_bfloat16* dm, const __nv_bfloat16* expert_out,
+    const int* topk_idx, const int* route_pos, const int* offsets, const float* topk_gates,
+    __nv_bfloat16* dy, float* dg, int NT, int K, int C, cudaStream_t s
 );
 
 // In-place GELU forward: x[NTK,hi] → x (overwritten)

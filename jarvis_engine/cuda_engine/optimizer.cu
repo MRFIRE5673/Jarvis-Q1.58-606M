@@ -26,17 +26,23 @@ __global__ void adamw_vec4_kernel(
     float*         __restrict__ m,
     float*         __restrict__ v,
     const __nv_bfloat16* __restrict__ grad,
-    float lr, float beta1, float beta2,
+    float beta1, float beta2,
     float eps, float wd,
     const float* __restrict__ d_bc1,
     const float* __restrict__ d_bc2,
     const float* __restrict__ d_clip_coef,
+    const float* __restrict__ d_lr,
     int N4
 ) {
     // Load scalars once per block via uniform read (compiler hoists to smem)
     float bc1      = *d_bc1;
     float bc2      = *d_bc2;
     float clip_coef = *d_clip_coef;
+    float lr       = *d_lr;
+
+    // A non-finite clip coefficient is the device-side abort signal produced
+    // by prepare_optimizer_step_kernel. Skip all parameter and Adam-state writes.
+    if (!isfinite(clip_coef)) return;
 
     int i4 = blockIdx.x * blockDim.x + threadIdx.x;
     if (i4 >= N4) return;
@@ -86,8 +92,10 @@ __global__ void prepare_optimizer_step_kernel(
     int* d_step_count,
     float* d_bc1, float* d_bc2,
     float* d_clip_coef,
+    float* d_lr,
     const float* d_grad_norm_sq,
-    float beta1, float beta2, float grad_clip
+    float beta1, float beta2, float grad_clip, float base_lr,
+    int warmup_steps, int decay_steps, float min_lr_ratio
 ) {
     if (threadIdx.x != 0) return;
     int t = atomicAdd(d_step_count, 1) + 1;  // pre-increment (t = new step)
@@ -100,21 +108,42 @@ __global__ void prepare_optimizer_step_kernel(
     (void)b1t; (void)b2t;
 
     // Compute clip coef: min(grad_clip / (sqrt(grad_norm_sq) + 1e-6), 1.0)
-    float gnorm = sqrtf(*d_grad_norm_sq);
-    *d_clip_coef = fminf(grad_clip / (gnorm + 1e-6f), 1.0f);
+    float norm_sq = *d_grad_norm_sq;
+    if (!isfinite(norm_sq) || norm_sq < 0.0f) {
+        *d_clip_coef = __int_as_float(0x7fffffff);
+    } else {
+        float gnorm = sqrtf(norm_sq);
+        *d_clip_coef = fminf(grad_clip / (gnorm + 1e-6f), 1.0f);
+    }
+
+    float scale;
+    if (warmup_steps > 0 && t <= warmup_steps) {
+        scale = (float)t / (float)warmup_steps;
+    } else if (decay_steps > warmup_steps && t < decay_steps) {
+        float p = ((float)t - (float)warmup_steps) /
+                  (float)(decay_steps - warmup_steps);
+        p = fminf(fmaxf(p, 0.0f), 1.0f);
+        scale = min_lr_ratio + 0.5f * (1.0f - min_lr_ratio) *
+                (1.0f + cosf(3.14159265358979323846f * p));
+    } else {
+        scale = min_lr_ratio;
+    }
+    *d_lr = base_lr * fmaxf(scale, 0.0f);
 }
 
 void launch_prepare_optimizer_step(
     int* d_step_count,
     float* d_bc1, float* d_bc2,
-    float* d_clip_coef,
+    float* d_clip_coef, float* d_lr,
     const float* d_grad_norm_sq,
-    float beta1, float beta2, float grad_clip,
+    float beta1, float beta2, float grad_clip, float base_lr,
+    int warmup_steps, int decay_steps, float min_lr_ratio,
     cudaStream_t s
 ) {
     prepare_optimizer_step_kernel<<<1, 32, 0, s>>>(
-        d_step_count, d_bc1, d_bc2, d_clip_coef,
-        d_grad_norm_sq, beta1, beta2, grad_clip);
+        d_step_count, d_bc1, d_bc2, d_clip_coef, d_lr,
+        d_grad_norm_sq, beta1, beta2, grad_clip, base_lr,
+        warmup_steps, decay_steps, min_lr_ratio);
     CUDA_CHECK_LAST();
 }
 
@@ -122,10 +151,10 @@ void launch_adamw_fused(
     float* p_fp32, __nv_bfloat16* p_bf16,
     float* m, float* v,
     const __nv_bfloat16* grad,
-    float lr, float beta1, float beta2,
+    float /*lr*/, float beta1, float beta2,
     float eps, float wd,
     const float* d_bc1, const float* d_bc2,
-    const float* d_clip_coef,
+    const float* d_clip_coef, const float* d_lr,
     int N, cudaStream_t s
 ) {
     int N4    = N / 4;
@@ -133,8 +162,8 @@ void launch_adamw_fused(
     int GRID  = (N4 + BLOCK - 1) / BLOCK;
     adamw_vec4_kernel<<<GRID, BLOCK, 0, s>>>(
         p_fp32, p_bf16, m, v, grad,
-        lr, beta1, beta2, eps, wd,
-        d_bc1, d_bc2, d_clip_coef, N4);
+        beta1, beta2, eps, wd,
+        d_bc1, d_bc2, d_clip_coef, d_lr, N4);
     CUDA_CHECK_LAST();
 }
 

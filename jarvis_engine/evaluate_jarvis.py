@@ -19,7 +19,6 @@ import argparse
 import statistics
 import torch
 import torch.nn.functional as F
-import tiktoken
 
 if sys.platform == "win32":
     try:
@@ -39,6 +38,7 @@ for p in [WORKSPACE_ROOT, JARVIS_ENGINE_PATH, SPARSE_DIR, ATTN_DIR]:
         sys.path.insert(0, p)
 
 from jarvis_model import Jarvis
+from tokenizer import ENCODING, StreamingDecoder
 
 
 def resolve_path(path_arg, default_name=None):
@@ -100,6 +100,13 @@ def parse_args():
 
 def load_binary_ckpt(resolved_ckpt, model, device="cuda"):
     import struct, numpy as np
+
+    def native_quantize(weight):
+        # Native training shares one AbsMean scale across each stored matrix.
+        weight = weight.float()
+        alpha = weight.abs().mean()
+        return (weight.div(alpha + 1e-8).clamp(-1, 1).round() * alpha).to(torch.bfloat16).float()
+
     with open(resolved_ckpt, "rb") as f:
         step = struct.unpack("i", f.read(4))[0]
         Vp, C, L, E, hi, H = 50304, 1024, 24, 4, 2048, 16
@@ -117,10 +124,11 @@ def load_binary_ckpt(resolved_ckpt, model, device="cuda"):
         model.final_norm.weight.data.copy_(final_norm.to(device=device, dtype=model.final_norm.weight.dtype))
 
         for l in range(L):
-            qkv = read_tensor((3 * C, C))
-            out = read_tensor((C, C))
-            w1 = read_tensor((E * hi, C))
-            w2 = read_tensor((E * C, hi))
+            qkv = native_quantize(read_tensor((3 * C, C)))
+            out = native_quantize(read_tensor((C, C)))
+            # The native engine quantizes all experts in a layer with one scale.
+            w1 = native_quantize(read_tensor((E * hi, C)).view(E, hi, C))
+            w2 = native_quantize(read_tensor((E * C, hi)).view(E, C, hi))
             norm1 = read_tensor((C,))
             norm2 = read_tensor((C,))
             gamma = read_tensor((H,))
@@ -128,18 +136,28 @@ def load_binary_ckpt(resolved_ckpt, model, device="cuda"):
             b = model.blocks[l]
             b.norm1.weight.data.copy_(norm1.to(device=device, dtype=b.norm1.weight.dtype))
             b.norm2.weight.data.copy_(norm2.to(device=device, dtype=b.norm2.weight.dtype))
-            b.attn.gamma_raw.data.copy_(gamma.to(device=device, dtype=b.attn.gamma_raw.dtype))
+            # The native engine stores log(gamma); the PyTorch recurrence stores logit(gamma).
+            decay = gamma.float().exp().clamp_(1e-6, 1.0 - 1e-6)
+            gamma_logit = torch.logit(decay)
+            b.attn.gamma_raw.data.copy_(gamma_logit.to(device=device, dtype=b.attn.gamma_raw.dtype))
             if hasattr(b.attn, "q_proj"):
                 b.attn.q_proj.weight.data.copy_(qkv[:C].to(device=device, dtype=b.attn.q_proj.weight.dtype))
                 b.attn.k_proj.weight.data.copy_(qkv[C:2*C].to(device=device, dtype=b.attn.k_proj.weight.dtype))
                 b.attn.v_proj.weight.data.copy_(qkv[2*C:].to(device=device, dtype=b.attn.v_proj.weight.dtype))
+                for proj in (b.attn.q_proj, b.attn.k_proj, b.attn.v_proj):
+                    proj._native_prequantized = True
             elif hasattr(b.attn, "qkv_proj"):
                 b.attn.qkv_proj.weight.data.copy_(qkv.to(device=device, dtype=b.attn.qkv_proj.weight.dtype))
+                b.attn.qkv_proj._native_prequantized = True
             b.attn.out_proj.weight.data.copy_(out.to(device=device, dtype=b.attn.out_proj.weight.dtype))
+            b.attn.out_proj._native_prequantized = True
 
             for e in range(E):
-                b.moe.w1[e].weight.data.copy_(w1[e*hi:(e+1)*hi].to(device=device, dtype=b.moe.w1[e].weight.dtype))
-                b.moe.w2[e].weight.data.copy_(w2[e*C:(e+1)*C].to(device=device, dtype=b.moe.w2[e].weight.dtype))
+                b.moe.w1[e].weight.data.copy_(w1[e].to(device=device, dtype=b.moe.w1[e].weight.dtype))
+                b.moe.w2[e].weight.data.copy_(w2[e].to(device=device, dtype=b.moe.w2[e].weight.dtype))
+                b.moe.w1[e]._native_prequantized = True
+                b.moe.w2[e]._native_prequantized = True
+            b.moe._native_prequantized = True
 
         rem = f.read()
         if len(rem) >= L * E * C * 4:
@@ -185,7 +203,9 @@ def load_jarvis_model(ckpt_path=None, device="cuda"):
             trained_step = load_binary_ckpt(resolved_ckpt, model, device=device)
             print(f"Native binary checkpoint loaded successfully (step: {trained_step})")
         else:
-            ckpt = torch.load(resolved_ckpt, map_location="cpu", weights_only=False)
+            # State-dict checkpoints do not need pickle execution. Keep loading
+            # restricted so a downloaded or user-supplied checkpoint cannot run code.
+            ckpt = torch.load(resolved_ckpt, map_location="cpu", weights_only=True)
             state_dict = ckpt["model_state_dict"]
             new_state_dict = {k.replace("_orig_mod.", "", 1) if k.startswith("_orig_mod.") else k: v
                               for k, v in state_dict.items()}
@@ -198,7 +218,7 @@ def load_jarvis_model(ckpt_path=None, device="cuda"):
         trained_step = 0
         resolved_ckpt = "None (untrained / fresh weights)"
         print("[Notice] No checkpoint found. Model initialized with random weights.")
-        print("         To train the model on tokens, use Option 7 in start.bat.")
+        print("         To train the model on tokens, use Train / resume in start.bat.")
 
     status = model.get_backend_status()
     device_name = torch.cuda.get_device_name(0) if device == "cuda" else "CPU"
@@ -235,39 +255,34 @@ def print_model_info(model, ckpt_path, device="cuda"):
 def sample_next_token(logits, temperature=0.7, top_k=50, top_p=0.9, repetition_penalty=1.15, prev_tokens=None):
     """Samples next token with temperature, top-k, and nucleus top-p filtering."""
     if prev_tokens is not None and repetition_penalty > 1.0:
-        for t in set(prev_tokens):
-            if t < logits.size(-1):
-                if logits[0, t] > 0:
-                    logits[0, t] /= repetition_penalty
-                else:
-                    logits[0, t] *= repetition_penalty
+        recent = sorted({t for t in prev_tokens[-256:] if 0 <= t < logits.size(-1)})
+        if recent:
+            ids = torch.tensor(recent, device=logits.device, dtype=torch.long)
+            values = logits.index_select(-1, ids)
+            values = torch.where(values > 0, values / repetition_penalty, values * repetition_penalty)
+            logits = logits.scatter(-1, ids.expand(logits.size(0), -1), values)
 
     if temperature is None or temperature <= 0.0:
         return torch.argmax(logits, dim=-1, keepdim=True)
 
-    logits = logits / max(temperature, 1e-5)
-
-    # Top-K filtering
+    logits = logits.float() / max(temperature, 1e-5)
     if top_k is not None and top_k > 0:
-        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-        logits[logits < v[:, [-1]]] = -float('Inf')
-
-    # Top-P (Nucleus) filtering
+        candidate_logits, candidate_ids = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1, sorted=True)
+    else:
+        candidate_logits, candidate_ids = torch.sort(logits, descending=True, dim=-1)
     if top_p is not None and 0.0 < top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        cumulative_probs = torch.cumsum(F.softmax(candidate_logits, dim=-1), dim=-1)
+        remove = cumulative_probs > top_p
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+        candidate_logits = candidate_logits.masked_fill(remove, -float("inf"))
 
-        sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-
-        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-        logits[indices_to_remove] = -float('Inf')
-
-    probs = F.softmax(logits, dim=-1)
-    if torch.isnan(probs).any():
-        return torch.argmax(logits, dim=-1, keepdim=True)
-    return torch.multinomial(probs, num_samples=1)
+    probs = torch.nan_to_num(F.softmax(candidate_logits, dim=-1), nan=0.0)
+    probs_sum = probs.sum(dim=-1, keepdim=True)
+    fallback = F.one_hot(candidate_logits.argmax(dim=-1), num_classes=candidate_logits.size(-1)).to(probs.dtype)
+    probs = torch.where(probs_sum > 0, probs / probs_sum.clamp_min(1e-20), fallback)
+    selected = torch.multinomial(probs, num_samples=1)
+    return candidate_ids.gather(-1, selected)
 
 
 @torch.inference_mode()
@@ -294,7 +309,7 @@ def generate_streaming(
     model.eval()
     model.reset_state()
 
-    prompt_ids = enc.encode(prompt_text)
+    prompt_ids = enc.encode_ordinary(prompt_text)
     if len(prompt_ids) == 0:
         prompt_ids = [enc.eot_token]
 
@@ -308,7 +323,8 @@ def generate_streaming(
                                  repetition_penalty=repetition_penalty, prev_tokens=prompt_ids)
 
     generated_token_ids = []
-    prev_decoded_len = 0
+    decoder = StreamingDecoder(enc)
+    decoded_parts = []
 
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
@@ -321,16 +337,12 @@ def generate_streaming(
 
         generated_token_ids.append(tok_id)
 
-        # Stream decoded token delta
-        full_gen_text = enc.decode(generated_token_ids)
-        new_text = full_gen_text[prev_decoded_len:]
-        try:
+        # Decode only this token's bytes; the incremental decoder handles split UTF-8 characters.
+        new_text = decoder.push(tok_id)
+        decoded_parts.append(new_text)
+        if new_text:
             sys.stdout.write(new_text)
             sys.stdout.flush()
-        except Exception:
-            sys.stdout.write(new_text.encode("utf-8", errors="replace").decode("utf-8", errors="replace"))
-            sys.stdout.flush()
-        prev_decoded_len = len(full_gen_text)
 
         # O(1) single-token forward: feeds only the new token, S_t and H_t carried
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
@@ -343,7 +355,9 @@ def generate_streaming(
     torch.cuda.synchronize()
     t_end = time.perf_counter()
 
-    sys.stdout.write("\n")
+    tail = decoder.finish()
+    decoded_parts.append(tail)
+    sys.stdout.write(tail + "\n")
     sys.stdout.flush()
 
     duration = t_end - t_start
@@ -367,7 +381,7 @@ def generate_streaming(
 
     # Clean model state after response completion
     model.reset_state()
-    return enc.decode(generated_token_ids), stats
+    return "".join(decoded_parts), stats
 
 
 def interactive_terminal(model, enc, args, ckpt_path, device="cuda"):
@@ -428,7 +442,7 @@ def evaluate_corpus(model, file_path, enc, num_windows=200, seq_len=256, seed=42
     with open(resolved_file, "r", encoding="utf-8", errors="ignore") as f:
         text = f.read()
 
-    tokens = torch.tensor(enc.encode(text), dtype=torch.long, device=device)
+    tokens = torch.tensor(enc.encode_ordinary(text), dtype=torch.long, device=device)
     total_tokens_in_file = len(tokens)
 
     required_tokens = seq_len + 1
@@ -478,7 +492,7 @@ def evaluate_corpus(model, file_path, enc, num_windows=200, seq_len=256, seed=42
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
-    enc = tiktoken.get_encoding("gpt2")
+    enc = ENCODING
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 1. Load production model

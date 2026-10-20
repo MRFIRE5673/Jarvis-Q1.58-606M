@@ -25,7 +25,8 @@ __global__ void top2_gating_kernel(
     float*               __restrict__ probs,   // [NT, 4]
     int*                 __restrict__ topk_idx,// [NT, 2]
     float*               __restrict__ topk_gates,// [NT, 2]
-    int NT
+    int*                 __restrict__ expert_counts,
+    int NT, float noise_std, const int* step, int noise_seed
 ) {
     int tok = blockIdx.x * blockDim.x + threadIdx.x;
     if (tok >= NT) return;
@@ -33,8 +34,23 @@ __global__ void top2_gating_kernel(
     int base = tok * 4;
     float lg[4];
     #pragma unroll
-    for (int e = 0; e < 4; ++e)
+    for (int e = 0; e < 4; ++e) {
         lg[e] = __bfloat162float(logits[base + e]);
+        if (noise_std > 0.0f) {
+            // Stateless Box-Muller noise keeps CUDA graph replay deterministic
+            // while matching the paper's N(0, sigma^2) router perturbation.
+            unsigned step_seed = step ? (unsigned)(*step) : 0u;
+            unsigned h = (unsigned)(tok * 0x9e3779b9u) ^
+                         (unsigned)(e * 0x85ebca6bu) ^
+                         (unsigned)(noise_seed * 0xc2b2ae35u) ^
+                         (step_seed * 0x27d4eb2fu);
+            h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15;
+            unsigned h2 = h * 0x846ca68bu + 0xda3e39cbu;
+            float u1 = ((h & 0x00ffffffu) + 1.0f) * (1.0f / 16777217.0f);
+            float u2 = ((h2 & 0x00ffffffu) + 1.0f) * (1.0f / 16777217.0f);
+            lg[e] += noise_std * sqrtf(-2.0f * logf(u1)) * cosf(6.28318530718f * u2);
+        }
+    }
 
     // Stable softmax over E=4
     float mx = fmaxf(fmaxf(lg[0], lg[1]), fmaxf(lg[2], lg[3]));
@@ -60,16 +76,46 @@ __global__ void top2_gating_kernel(
     topk_idx  [tok * 2 + 0] = i0;  topk_idx  [tok * 2 + 1] = i1;
     topk_gates[tok * 2 + 0] = lg[i0] / g_sum;
     topk_gates[tok * 2 + 1] = lg[i1] / g_sum;
+    if (expert_counts) {
+        atomicAdd(&expert_counts[i0], 1);
+        atomicAdd(&expert_counts[i1], 1);
+    }
 }
 
 void launch_top2_gating(
     const __nv_bfloat16* logits, float* probs,
     int* topk_idx, float* topk_gates,
-    int NT, int E, cudaStream_t s
+    int NT, int E, float noise_std, const int* step, int noise_seed, cudaStream_t s
 ) {
     (void)E;  // locked to 4
     top2_gating_kernel<<<(NT + 255) / 256, 256, 0, s>>>(
-        logits, probs, topk_idx, topk_gates, NT);
+        logits, probs, topk_idx, topk_gates, nullptr, NT, noise_std, step, noise_seed);
+    CUDA_CHECK_LAST();
+}
+
+void launch_top2_gating_count(
+    const __nv_bfloat16* logits, float* probs,
+    int* topk_idx, float* topk_gates, int* expert_counts,
+    int NT, int E, float noise_std, const int* step, int noise_seed, cudaStream_t s
+) {
+    (void)E;  // locked to 4
+    top2_gating_kernel<<<(NT + 255) / 256, 256, 0, s>>>(
+        logits, probs, topk_idx, topk_gates, expert_counts, NT, noise_std, step, noise_seed);
+    CUDA_CHECK_LAST();
+}
+
+__global__ void expert_offsets_kernel(const int* counts, int* offsets, int E) {
+    if (blockIdx.x || threadIdx.x) return;
+    int total = 0;
+    offsets[0] = 0;
+    for (int e = 0; e < E; ++e) {
+        total += counts[e];
+        offsets[e + 1] = total;
+    }
+}
+
+void launch_expert_offsets(const int* counts, int* offsets, int E, cudaStream_t s) {
+    expert_offsets_kernel<<<1, 1, 0, s>>>(counts, offsets, E);
     CUDA_CHECK_LAST();
 }
 
@@ -104,6 +150,153 @@ void launch_dispatch_gather(
 ) {
     int NTK = NT * K;
     dispatch_gather_kernel<<<NTK, C / 8, 0, s>>>(x, topk_idx, dispatch_x, NT, K, C);
+    CUDA_CHECK_LAST();
+}
+
+__global__ void sparse_dispatch_kernel(
+    const __nv_bfloat16* __restrict__ x, const int* __restrict__ topk_idx,
+    __nv_bfloat16* __restrict__ dispatch_x, int* __restrict__ route_pos,
+    int* __restrict__ route_write, const int* __restrict__ offsets, int NT, int K, int C
+) {
+    int flat = blockIdx.x;
+    int tok = flat / K;
+    if (tok >= NT) return;
+    int e = topk_idx[flat];
+    __shared__ int pos;
+    if (threadIdx.x == 0) pos = atomicAdd(&route_write[e], 1);
+    __syncthreads();
+    route_pos[flat] = pos;
+    int vec = threadIdx.x;
+    if (vec < C / 8) {
+        const uint4* src = reinterpret_cast<const uint4*>(x + (size_t)tok * C + vec * 8);
+        uint4* dst = reinterpret_cast<uint4*>(dispatch_x + ((size_t)offsets[e] + pos) * C + vec * 8);
+        *dst = *src;
+    }
+}
+
+void launch_sparse_dispatch(
+    const __nv_bfloat16* x, const int* topk_idx,
+    __nv_bfloat16* dispatch_x, int* route_pos, int* route_write,
+    const int* offsets, int NT, int K, int E, int C, cudaStream_t s
+) {
+    CUDA_CHECK(cudaMemsetAsync(route_write, 0, (size_t)E * sizeof(int), s));
+    sparse_dispatch_kernel<<<NT * K, C / 8, 0, s>>>(
+        x, topk_idx, dispatch_x, route_pos, route_write, offsets, NT, K, C);
+    CUDA_CHECK_LAST();
+}
+
+__global__ void sparse_dispatch_cached_kernel(
+    const __nv_bfloat16* __restrict__ x, const int* __restrict__ topk_idx,
+    const int* __restrict__ route_pos, __nv_bfloat16* __restrict__ dispatch_x,
+    const int* __restrict__ offsets, int NT, int K, int C
+) {
+    int flat = blockIdx.x;
+    int tok = flat / K;
+    if (tok >= NT) return;
+    int e = topk_idx[flat];
+    int pos = route_pos[flat];
+    int vec = threadIdx.x;
+    if (vec < C / 8) {
+        const uint4* src = reinterpret_cast<const uint4*>(x + (size_t)tok * C + vec * 8);
+        uint4* dst = reinterpret_cast<uint4*>(dispatch_x + ((size_t)offsets[e] + pos) * C + vec * 8);
+        *dst = *src;
+    }
+}
+
+void launch_sparse_dispatch_cached(
+    const __nv_bfloat16* x, const int* topk_idx, const int* route_pos,
+    __nv_bfloat16* dispatch_x, const int* offsets, int NT, int K, int C,
+    cudaStream_t s
+) {
+    sparse_dispatch_cached_kernel<<<NT * K, C / 8, 0, s>>>(
+        x, topk_idx, route_pos, dispatch_x, offsets, NT, K, C);
+    CUDA_CHECK_LAST();
+}
+
+__global__ void sparse_combine_fwd_kernel(
+    const __nv_bfloat16* __restrict__ expert_out,
+    const __nv_bfloat16* __restrict__ x_residual,
+    const int* __restrict__ topk_idx, const int* __restrict__ route_pos,
+    const int* __restrict__ offsets,
+    const float* __restrict__ gates, __nv_bfloat16* __restrict__ out,
+    int NT, int K, int C
+) {
+    int tok = blockIdx.x;
+    int vec = threadIdx.x;
+    if (vec >= C / 8) return;
+    int col = vec * 8;
+    const uint4* xr = reinterpret_cast<const uint4*>(x_residual + (size_t)tok * C + col);
+    const __nv_bfloat16* xrv = reinterpret_cast<const __nv_bfloat16*>(xr);
+    float v[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = __bfloat162float(xrv[j]);
+    for (int j = 0; j < 8; ++j) {
+        for (int k = 0; k < K; ++k) {
+            int e = topk_idx[tok * K + k];
+            int pos = route_pos[tok * K + k];
+            v[j] += gates[tok * K + k] * __bfloat162float(
+                expert_out[((size_t)offsets[e] + pos) * C + col + j]);
+        }
+    }
+    uint4 packed;
+    __nv_bfloat16* pv = reinterpret_cast<__nv_bfloat16*>(&packed);
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) pv[j] = __float2bfloat16(v[j]);
+    *reinterpret_cast<uint4*>(out + (size_t)tok * C + col) = packed;
+}
+
+void launch_sparse_combine_fwd(
+    const __nv_bfloat16* expert_out, const __nv_bfloat16* x_residual,
+    const int* topk_idx, const int* route_pos, const int* offsets,
+    const float* topk_gates, __nv_bfloat16* moe_out, int NT, int K, int C, cudaStream_t s
+) {
+    sparse_combine_fwd_kernel<<<NT, 128, 0, s>>>(
+        expert_out, x_residual, topk_idx, route_pos, offsets, topk_gates, moe_out, NT, K, C);
+    CUDA_CHECK_LAST();
+}
+
+__global__ void sparse_combine_bwd_kernel(
+    const __nv_bfloat16* __restrict__ dm,
+    const __nv_bfloat16* __restrict__ expert_out,
+    const int* __restrict__ topk_idx, const int* __restrict__ route_pos,
+    const int* __restrict__ offsets,
+    const float* __restrict__ gates, __nv_bfloat16* __restrict__ dy,
+    float* __restrict__ dg, int NT, int K, int C
+) {
+    int tok = blockIdx.x;
+    __shared__ float sums[2][32];
+    float local[2] = {0.f, 0.f};
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        float g = __bfloat162float(dm[(size_t)tok * C + i]);
+        for (int k = 0; k < K; ++k) {
+            int e = topk_idx[tok * K + k];
+            int pos = route_pos[tok * K + k];
+            dy[((size_t)offsets[e] + pos) * C + i] = __float2bfloat16(g * gates[tok * K + k]);
+            local[k] += g * __bfloat162float(expert_out[((size_t)offsets[e] + pos) * C + i]);
+        }
+    }
+    for (int k = 0; k < K; ++k) {
+        float v = local[k];
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
+        if ((threadIdx.x & 31) == 0) sums[k][threadIdx.x >> 5] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        for (int k = 0; k < K; ++k) {
+            float v = threadIdx.x < (blockDim.x / 32) ? sums[k][threadIdx.x] : 0.f;
+            v = warp_sum(v);
+            if (threadIdx.x == 0) dg[tok * K + k] = v;
+        }
+    }
+}
+
+void launch_sparse_combine_bwd(
+    const __nv_bfloat16* dm, const __nv_bfloat16* expert_out,
+    const int* topk_idx, const int* route_pos, const int* offsets, const float* topk_gates,
+    __nv_bfloat16* dy, float* dg, int NT, int K, int C, cudaStream_t s
+) {
+    sparse_combine_bwd_kernel<<<NT, 256, 0, s>>>(
+        dm, expert_out, topk_idx, route_pos, offsets, topk_gates, dy, dg, NT, K, C);
     CUDA_CHECK_LAST();
 }
 

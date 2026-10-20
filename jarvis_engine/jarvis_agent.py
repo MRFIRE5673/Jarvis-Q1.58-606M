@@ -20,7 +20,6 @@ import subprocess
 import re
 import argparse
 import torch
-import tiktoken
 
 if sys.platform == "win32":
     try:
@@ -30,6 +29,7 @@ if sys.platform == "win32":
         pass
 
 WORKSPACE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_CODE_EXECUTION_ENABLED = False
 JARVIS_ENGINE_PATH = os.path.join(WORKSPACE_ROOT, "jarvis_engine")
 SPARSE_DIR = os.path.join(WORKSPACE_ROOT, "sparse_model_cuda")
 ATTN_DIR = os.path.join(WORKSPACE_ROOT, "associative_attention_cuda")
@@ -39,6 +39,7 @@ for p in [WORKSPACE_ROOT, JARVIS_ENGINE_PATH, SPARSE_DIR, ATTN_DIR]:
         sys.path.insert(0, p)
 
 from evaluate_jarvis import load_jarvis_model, sample_next_token
+from tokenizer import ENCODING, StreamingDecoder
 
 
 # ---------------------------------------------------------------------------
@@ -49,8 +50,19 @@ class AgentTools:
     """Core local execution tools for Jarvis Agent."""
 
     @staticmethod
+    def _workspace_path(filepath: str) -> str:
+        """Resolve a path and reject escapes from the agent workspace."""
+        root = os.path.realpath(WORKSPACE_ROOT)
+        target = os.path.realpath(os.path.join(root, filepath))
+        if os.path.commonpath((root, target)) != root:
+            raise ValueError("path must stay inside the workspace")
+        return target
+
+    @staticmethod
     def run_python(code: str, timeout: int = 15) -> str:
         """Executes Python code in a fresh subprocess and returns stdout/stderr."""
+        if not _CODE_EXECUTION_ENABLED:
+            return "[Blocked: enable Python/CMD execution for this session at startup first]"
         if not code.strip():
             return "[Error: Empty python code]"
         try:
@@ -82,6 +94,8 @@ class AgentTools:
     @staticmethod
     def run_cmd(command: str, timeout: int = 15) -> str:
         """Executes a Windows shell command and returns output."""
+        if not _CODE_EXECUTION_ENABLED:
+            return "[Blocked: enable Python/CMD execution for this session at startup first]"
         if not command.strip():
             return "[Error: Empty command]"
         try:
@@ -114,7 +128,7 @@ class AgentTools:
     @staticmethod
     def read_file(filepath: str, max_lines: int = 100) -> str:
         """Reads up to max_lines from a file."""
-        target = os.path.abspath(os.path.join(WORKSPACE_ROOT, filepath)) if not os.path.isabs(filepath) else filepath
+        target = AgentTools._workspace_path(filepath)
         if not os.path.exists(target):
             return f"[Error: File not found: {filepath}]"
         try:
@@ -128,8 +142,8 @@ class AgentTools:
     @staticmethod
     def write_file(filepath: str, content: str) -> str:
         """Writes text content to a file."""
-        target = os.path.abspath(os.path.join(WORKSPACE_ROOT, filepath)) if not os.path.isabs(filepath) else filepath
         try:
+            target = AgentTools._workspace_path(filepath)
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with open(target, "w", encoding="utf-8", errors="replace") as f:
                 f.write(content)
@@ -224,13 +238,13 @@ class JarvisAgent:
         self.model = model
         self.enc = enc
         self.device = device
-        self.auto_execute = True
+        self.auto_execute = False
 
     def generate_response(self, prompt: str, max_tokens: int = 128, temp: float = 0.5):
         """Streams generation from model with Phase 5 state caching."""
         self.model.eval()
         self.model.reset_state()
-        prompt_ids = self.enc.encode(prompt)
+        prompt_ids = self.enc.encode_ordinary(prompt)
         if not prompt_ids:
             prompt_ids = [self.enc.eot_token]
 
@@ -243,17 +257,18 @@ class JarvisAgent:
                                      repetition_penalty=1.15, prev_tokens=prompt_ids)
 
         token_ids = []
-        prev_len = 0
+        decoded_parts = []
+        decoder = StreamingDecoder(self.enc)
         for _ in range(max_tokens):
             tid = next_tok.item()
             if tid == self.enc.eot_token:
                 break
             token_ids.append(tid)
-            decoded = self.enc.decode(token_ids)
-            delta = decoded[prev_len:]
-            sys.stdout.write(delta)
-            sys.stdout.flush()
-            prev_len = len(decoded)
+            delta = decoder.push(tid)
+            decoded_parts.append(delta)
+            if delta:
+                sys.stdout.write(delta)
+                sys.stdout.flush()
 
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 logits, _ = self.model(next_tok, persist_state=True)
@@ -262,10 +277,12 @@ class JarvisAgent:
             next_tok = sample_next_token(next_logits, temperature=temp, top_k=50, top_p=0.9,
                                          repetition_penalty=1.15, prev_tokens=seen)
 
-        sys.stdout.write("\n")
+        tail = decoder.finish()
+        decoded_parts.append(tail)
+        sys.stdout.write(tail + "\n")
         sys.stdout.flush()
         self.model.reset_state()
-        return self.enc.decode(token_ids)
+        return "".join(decoded_parts)
 
     def run_agentic_turn(self, user_query: str):
         """
@@ -320,13 +337,25 @@ class JarvisAgent:
 
 
 def run_interactive_agent():
+    global _CODE_EXECUTION_ENABLED
     parser = argparse.ArgumentParser(description="Jarvis Agentic AI Terminal")
     parser.add_argument("--ckpt", type=str, default=None, help="Checkpoint to load (optional)")
-    parser.add_argument("--auto", action="store_true", default=True, help="Auto-execute tools")
+    parser.add_argument("--auto", action="store_true", default=False, help="Auto-execute generated tools")
     args = parser.parse_args()
 
+    try:
+        answer = input(
+            "Allow model-generated Python and shell commands for this session? "
+            "They run with your Windows account permissions. Type YES to enable: "
+        ).strip()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    _CODE_EXECUTION_ENABLED = answer == "YES"
+    if not _CODE_EXECUTION_ENABLED:
+        print("Python/CMD tools are disabled for this session; file and GPU tools remain available.")
+
     model, ckpt_path, step = load_jarvis_model(args.ckpt, device="cuda")
-    enc = tiktoken.get_encoding("gpt2")
+    enc = ENCODING
     agent = JarvisAgent(model, enc, device="cuda")
     agent.auto_execute = args.auto
 
@@ -336,7 +365,7 @@ def run_interactive_agent():
     print("Commands:")
     print("  /tools       - List available local tools")
     print("  /gpu         - Show live GPU telemetry")
-    print("  /auto [on/off]- Toggle automatic tool execution")
+    print("  /auto [on/off]- Toggle automatic tool execution (Python/CMD still require startup consent)")
     print("  /exit        - Exit the agent terminal")
     print("=" * 60 + "\n")
 
@@ -367,10 +396,10 @@ def run_interactive_agent():
             parts = query.split()
             if len(parts) > 1 and parts[1].lower() in ["off", "false", "0"]:
                 agent.auto_execute = False
-                print("[Auto-execution: OFF - will prompt before running tools]")
+                print("[Auto-execution: OFF - generated tool calls will not run]")
             else:
                 agent.auto_execute = True
-                print("[Auto-execution: ON - tools run immediately]")
+                print("[Auto-execution: ON - generated tool calls run automatically]")
             continue
 
         agent.run_agentic_turn(query)

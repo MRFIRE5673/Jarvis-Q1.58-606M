@@ -114,6 +114,7 @@ void launch_ternary_quantize(const float* W_fp32, const float* alpha,
 // ---------------------------------------------------------------------------
 __global__ void ternary_ste_bwd_kernel(
     const float*           __restrict__ W_fp32,
+    const float*           __restrict__ alpha,
     const __nv_bfloat16*   __restrict__ grad_W_q,
     float*                 __restrict__ grad_W_fp32,
     int N
@@ -121,12 +122,34 @@ __global__ void ternary_ste_bwd_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
     float g = __bfloat162float(grad_W_q[i]);
-    grad_W_fp32[i] = (fabsf(W_fp32[i]) <= 1.0f) ? g : 0.0f;
+    grad_W_fp32[i] = (fabsf(W_fp32[i]) <= *alpha) ? g : 0.0f;
 }
 
-void launch_ternary_ste_bwd(const float* W_fp32, const __nv_bfloat16* grad_W_q,
+void launch_ternary_ste_bwd(const float* W_fp32, const float* alpha,
+                             const __nv_bfloat16* grad_W_q,
                              float* grad_W_fp32, int N, cudaStream_t s) {
-    ternary_ste_bwd_kernel<<<(N + 255) / 256, 256, 0, s>>>(W_fp32, grad_W_q, grad_W_fp32, N);
+    ternary_ste_bwd_kernel<<<(N + 255) / 256, 256, 0, s>>>(W_fp32, alpha, grad_W_q, grad_W_fp32, N);
+    CUDA_CHECK_LAST();
+}
+
+// In-place straight-through estimator mask on BF16 gradient buffer:
+// grad_W_q[i] = (|W_fp32[i]| <= 1.0) ? grad_W_q[i] : 0.0
+__global__ void ternary_ste_mask_kernel(
+    const float*         __restrict__ W_fp32,
+    const float*         __restrict__ alpha,
+    __nv_bfloat16*       __restrict__ grad_W_q,
+    int N
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    if (fabsf(W_fp32[i]) > *alpha) {
+        grad_W_q[i] = __float2bfloat16(0.0f);
+    }
+}
+
+void launch_ternary_ste_mask(const float* W_fp32, const float* alpha,
+                             __nv_bfloat16* grad_W_q, int N, cudaStream_t s) {
+    ternary_ste_mask_kernel<<<(N + 255) / 256, 256, 0, s>>>(W_fp32, alpha, grad_W_q, N);
     CUDA_CHECK_LAST();
 }
 

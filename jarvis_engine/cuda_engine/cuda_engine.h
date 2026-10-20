@@ -44,7 +44,7 @@ struct JarvisConfig {
     int vocab_padded  = 50304;   // padded to multiple of 64 for TC alignment
 
     // ---- Training setup ----
-    int   batch_size   = 4;
+    int   batch_size   = 8;
     int   seq_len      = 512;
     int   accum_steps  = 2;
 
@@ -55,6 +55,9 @@ struct JarvisConfig {
     float eps          = 1e-8f;
     float weight_decay = 0.01f;
     float grad_clip    = 1.0f;
+    int   warmup_steps = 100;
+    int   decay_steps  = 10000;
+    float min_lr_ratio = 0.1f;
 
     // ---- Aux losses ----
     float balance_alpha   = 0.01f;   // MoE load balance
@@ -91,15 +94,13 @@ struct JarvisConfig {
 //   attn_out       : 4.19 MB
 //   norm2_out      : 4.19 MB
 //   router_logits  : 4×512×4 × 4B(FP32) = 0.016 MB
-//   dispatch_x     : 4×512×2×1024 × 2B = 8.39 MB  (K=2 copies)
-//   layer_h1       : 4×512×2×2048 × 2B = 16.78 MB (W1 output, in-place GELU)
-//   expert_out     : 8.39 MB
+//   Sparse mode compacts dispatch_x/layer_h1/expert_out to NT*K route rows;
+//   dense mode retains E*NT rows for the CUDA Graph path.
 //   moe_out        : 4.19 MB
 //   lsf_out        : 4.19 MB
 // ─────────────────────────────────────────────────────────────────────────
 // Total hot workspace ~= 88 MB > 48 MB L2
-// Strategy: keep layer_x + layer_x2 + attn_state permanently resident
-//           (~9 MB = comfortably within L2)
+// Strategy: mark layer_x persisting; layer_x2 and attn_state use normal L2 policy.
 // The rest streams through GDDR7 at 672 GB/s
 
 // ---------------------------------------------------------------------------
@@ -167,21 +168,31 @@ struct JarvisWorkspace {
     bf16*  tok_emb_out  = nullptr;  // [NT, C]  after embedding lookup
 
     // Layer-resident buffers (overwritten each layer)
-    bf16*  layer_x      = nullptr;  // [NT, C]  flowing residual stream  ← L2-pinned
-    bf16*  layer_x2     = nullptr;  // [NT, C]  staging / post-add       ← L2-pinned
+    bf16*  layer_x      = nullptr;  // [NT, C]  flowing residual stream  ← L2-persisting window
+    bf16*  layer_x2     = nullptr;  // [NT, C]  staging / post-add
     bf16*  norm1_out    = nullptr;  // [NT, C]
     bf16*  qkv_out      = nullptr;  // [NT, 3C]
     bf16*  q_buf        = nullptr;  // [B, H, T, D]  post ELU+RoPE
     bf16*  k_buf        = nullptr;  // [B, H, T, D]  post ELU+RoPE
     bf16*  v_buf        = nullptr;  // [B, H, T, D]
-    bf16*  attn_state   = nullptr;  // [B, H, D, D]  recurrent state S   ← L2-pinned
+    bf16*  attn_state   = nullptr;  // [B, H, D, D]  recurrent state S
     bf16*  attn_out     = nullptr;  // [NT, C]
     bf16*  norm2_out    = nullptr;  // [NT, C]
     bf16*  router_logits= nullptr;  // [NT, E] as BF16 (router is not quantized)
     float* router_probs = nullptr;  // [NT, E] FP32 softmax probs
     int*   topk_idx     = nullptr;  // [NT, K] int32
     float* topk_gates   = nullptr;  // [NT, K] normalized gate weights
-    bf16*  dispatch_x   = nullptr;  // [NTK, C]  gathered token reps
+    int*   route_pos    = nullptr;  // [NT, K] position in expert-major dispatch
+    int*   expert_counts = nullptr; // [E] active rows per expert
+    int*   expert_offsets = nullptr; // [E+1] compact expert segment offsets
+    int*   route_write  = nullptr;  // [E] temporary compact dispatch cursors
+    float* route_probs_cache = nullptr; // [L,NT,E]
+    int*   topk_idx_cache = nullptr;    // [L,NT,K]
+    float* topk_gates_cache = nullptr;  // [L,NT,K]
+    int*   route_pos_cache = nullptr;   // [L,NT,K]
+    int*   expert_counts_cache = nullptr; // [L,E]
+    int*   expert_offsets_cache = nullptr; // [L,E+1]
+    bf16*  dispatch_x   = nullptr;  // [NTK, C] compact expert-major token reps
     bf16*  layer_h1     = nullptr;  // [NTK, hi]  expert W1 output (in-place GELU)
     bf16*  expert_out   = nullptr;  // [NTK, C]   expert W2 output
     bf16*  moe_out      = nullptr;  // [NT, C]   scatter-combined
@@ -195,9 +206,6 @@ struct JarvisWorkspace {
 
     // Backward stash (saved for backward pass — 24 layers)
     bf16*  stash_x      = nullptr;  // [L, NT, C]  pre-norm1 residual
-    bf16*  stash_x2     = nullptr;  // [L, NT, C]  pre-norm2 residual
-    float* stash_rsqrt1 = nullptr;  // [L, NT] FP32 inverse RMS for norm1
-    float* stash_rsqrt2 = nullptr;  // [L, NT] FP32 inverse RMS for norm2
     bf16*  stash_h1     = nullptr;  // [L, NTK, hi]  pre-GELU (for GELU bwd)
 
     // Pre-quantized FP8 weight caches (quantized once per step, E4M3)
@@ -211,7 +219,6 @@ struct JarvisWorkspace {
     float**   w2_inv    = nullptr;  // [L] -> [1] inv scale for w2_q8
 
     // Gradient buffers — reused across layers
-    bf16*  d_logits     = nullptr;  // [NT, Vpad]
     bf16*  d_x          = nullptr;  // [NT, C]   gradient flowing backward
     bf16*  d_norm1      = nullptr;  // [NT, C]
     bf16*  d_qkv        = nullptr;  // [NT, 3C]
@@ -228,6 +235,8 @@ struct JarvisWorkspace {
     bf16** d_exp_w2     = nullptr;  // [L] → [E*C*hi]
     bf16** d_norm1_w    = nullptr;  // [L] → [C]
     bf16** d_norm2_w    = nullptr;  // [L] → [C]
+    float** d_norm1_f   = nullptr;  // [L] → [C] FP32 accumulator for norm1 grad
+    float** d_norm2_f   = nullptr;  // [L] → [C] FP32 accumulator for norm2 grad
     bf16** d_router_w   = nullptr;  // [L] → [E] (router grad)
     float** d_gamma     = nullptr;  // [L] → [H] FP32
     bf16*  d_tok_emb    = nullptr;  // [Vpad, C]  (accumulated, BF16)
@@ -249,6 +258,7 @@ struct JarvisWorkspace {
     float* d_bc1        = nullptr;  // [1] bias correction 1 (device scalar)
     float* d_bc2        = nullptr;  // [1] bias correction 2 (device scalar)
     float* d_clip_coef  = nullptr;  // [1] gradient clipping coefficient
+    float* d_lr         = nullptr;  // [1] scheduled learning rate
 };
 
 // ---------------------------------------------------------------------------

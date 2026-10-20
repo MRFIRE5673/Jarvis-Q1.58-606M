@@ -15,6 +15,8 @@
 // =============================================================================
 #include <cublas_v2.h>
 #include <cublasLt.h>
+#include <map>
+#include <tuple>
 #include "cuda_engine.h"
 
 // GemmDesc: shape for one matrix multiply
@@ -24,6 +26,10 @@ struct GemmDesc {
 };
 
 struct CublasLtEngine {
+    struct Fp8AlgoCacheEntry {
+        cublasLtMatmulAlgo_t algo{};
+        bool valid = false;
+    };
     cublasHandle_t handle    = nullptr;
     void*          workspace = nullptr;  // unused, kept for compat
     size_t         ws_bytes  = 0;
@@ -36,14 +42,24 @@ struct CublasLtEngine {
     uint8_t*         x8       = nullptr;       // activation scratch (16 MB)
     uint8_t*         w8       = nullptr;       // weight scratch (16 MB)
     float*           f8_stat  = nullptr;       // [amax_x, amax_w, inv_x, inv_w]
+    void*            grouped_ptrs_dev = nullptr; // [3,E] grouped GEMM pointer arrays
+    int*             grouped_dims_dev = nullptr; // [7,E] grouped layout dimensions
+    int              grouped_capacity = 0;
+    mutable bool     grouped_supported = true;
+    mutable std::map<std::tuple<int, int, int>, Fp8AlgoCacheEntry> fp8_algo_cache;
     // C[M,N] = X[M,K] * W[N,K]^T  via FP8, same layout as gemm()
     void gemm_fp8(int M, int N, int K, const bf16* X, const bf16* W, bf16* Y, cudaStream_t s) const;
     bool fp8_bwd = false;   // route eligible backward GEMMs (gemm_nn/gemm_tn) through FP8 (E5M2 grads)
     void gemm_fp8_ex(int M, int N, int K, const bf16* X, const bf16* W, bf16* Y,
                      bool xT, bool wT, bool grad, float beta, cudaStream_t s) const;
     // Use pre-quantized weight (skip weight amax+cast). d_inv_w is device ptr to inverse scale.
-    void gemm_fp8_cached(int M, int N, int K, const bf16* X, const uint8_t* W_q8,
-                         const float* d_inv_w, bf16* Y, cudaStream_t s) const;
+    void gemm_fp8_cached(int M, int N, int K, const bf16* X, const bf16* W_bf16,
+                         const uint8_t* W_q8, const float* d_inv_w,
+                         bf16* Y, cudaStream_t s) const;
+    // Grouped BF16 expert GEMM. Counts stay on device; no CPU readback.
+    bool grouped_expert_bf16(const bf16* X, const bf16* W, bf16* Y,
+                             const int* counts, const int* offsets,
+                             int E, int N, int K, cudaStream_t s) const;
 
     // GemmDesc members (kept for API compatibility)
     GemmDesc d_qkv_fwd;

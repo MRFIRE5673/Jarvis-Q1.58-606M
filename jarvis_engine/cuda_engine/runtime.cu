@@ -4,6 +4,8 @@
 // RTX 5070 / SM120 / CUDA 12.8+
 // =============================================================================
 #include "runtime.h"
+#include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <stdexcept>
 
@@ -52,19 +54,39 @@ void JarvisRuntime::init(int device) {
     CUDA_CHECK(cudaEventCreate(&ev_start));
     CUDA_CHECK(cudaEventCreate(&ev_stop));
 
-    // Enable L2 cache persistence for the hot working set
-    // L2 = 48 MB on RTX 5070 — pin up to 24 MB for our hot activations
-    // (other 24 MB left for texture/constant caches, driver overhead)
+    // Keep the measured 24 MB default; override with JARVIS_L2_PIN_MB to tune.
     if (props.persistingL2CacheMaxSize > 0) {
-        size_t pin_size = min(
-            (size_t)props.persistingL2CacheMaxSize,
-            24ULL * 1024 * 1024  // 24 MB
-        );
-        CUDA_CHECK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, pin_size));
-        printf("[runtime] L2 persistence: %.0f MB pinned (of %.0f MB total L2)\n",
-               pin_size / 1048576.0f,
+        size_t max_persisting_cache_size = (size_t)props.persistingL2CacheMaxSize;
+        persisting_cache_size = std::min(max_persisting_cache_size,
+                                         (size_t)24 * 1024 * 1024);
+        if (const char* env = std::getenv("JARVIS_L2_PIN_MB")) {
+            char* end = nullptr;
+            long mb = std::strtol(env, &end, 10);
+            if (end != env && *end == '\0' && mb >= 0) {
+                persisting_cache_size = (size_t)mb > max_persisting_cache_size / (1024 * 1024)
+                    ? max_persisting_cache_size : (size_t)mb * 1024 * 1024;
+            }
+        }
+        CUDA_CHECK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persisting_cache_size));
+        printf("[runtime] L2 persisting set-aside: %.0f MB (of %.0f MB total L2)\n",
+               persisting_cache_size / 1048576.0f,
                (float)props.l2CacheSize / 1048576.0f);
     }
+}
+
+void JarvisRuntime::set_persisting_window(void* base, size_t bytes) {
+    size_t window_bytes = std::min(bytes, (size_t)props.accessPolicyMaxWindowSize);
+    window_bytes = std::min(window_bytes, persisting_cache_size);
+    if (!base || !window_bytes) return;
+
+    cudaStreamAttrValue attr{};
+    attr.accessPolicyWindow.base_ptr = base;
+    attr.accessPolicyWindow.num_bytes = window_bytes;
+    attr.accessPolicyWindow.hitRatio = 1.0f;
+    attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+    CUDA_CHECK(cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr));
+    printf("[runtime] L2 persisting window: %.2f MB\n", window_bytes / 1048576.0f);
 }
 
 // ---------------------------------------------------------------------------

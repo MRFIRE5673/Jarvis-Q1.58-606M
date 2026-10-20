@@ -1,16 +1,21 @@
-"""
-build_engine.py — Minimal build patcher for cpu-torch + CUDA 13.3
-"""
+"""Build the native engine against the installed CUDA toolkit."""
 import os, sys
 
-CUDA_HOME = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+CUDA_HOME = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+if not CUDA_HOME:
+    candidates = sorted(
+        (os.path.join(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA", n)
+         for n in os.listdir(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
+         if n.startswith("v")), reverse=True
+    ) if os.path.isdir(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA") else []
+    CUDA_HOME = candidates[0] if candidates else None
+if not CUDA_HOME or not os.path.isdir(CUDA_HOME):
+    raise RuntimeError("CUDA toolkit not found; set CUDA_HOME or CUDA_PATH")
 os.environ["CUDA_HOME"] = CUDA_HOME
 os.environ["CUDA_PATH"] = CUDA_HOME
 os.environ["PATH"] = os.path.join(CUDA_HOME, "bin") + ";" + os.environ.get("PATH", "")
 
 import torch
-if torch.version.cuda is None:
-    torch.version.cuda = "13.3"
 
 import torch.utils.cpp_extension as cpp_ext
 
@@ -36,15 +41,6 @@ def _patched_ext_init(self, *args, **kwargs):
     remove = {'c10_cuda', 'torch_cuda', 'cudnn'}
     self.libraries = [l for l in (self.libraries or []) if l not in remove]
 cpp_ext.CUDAExtension.__init__ = _patched_ext_init
-
-# Suppress version checks
-for _fn in ('_check_cuda_version', '_check_compiler_abi_compatibility'):
-    _orig = getattr(cpp_ext, _fn, None)
-    if _orig:
-        def _noop(*a, _f=_orig, **kw):
-            try: _f(*a, **kw)
-            except: pass
-        setattr(cpp_ext, _fn, _noop)
 
 print(f"[build_engine] CUDA: {CUDA_HOME}  torch: {torch.__version__}")
 sys.argv = ["setup.py", "build_ext", "--inplace"]

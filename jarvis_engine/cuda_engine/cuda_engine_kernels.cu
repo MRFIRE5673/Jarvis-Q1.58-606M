@@ -286,21 +286,33 @@ void launch_rmsnorm_bwd(
 //    d) Label load via __ldg()
 // ===========================================================================
 __global__ void online_xent_bwd_kernel(
-    const bf16*   __restrict__ logits,
-    const int*    __restrict__ labels,
-    bf16*         __restrict__ d_logits,
+    bf16*         __restrict__ logits,
+    const int*    __restrict__ tok_ids,
     float*        __restrict__ loss_acc,
-    int NT, int Vpad
+    int B, int T, int Vpad, int accum_steps
 ) {
-    extern __shared__ float smem[];  // [64] for max+sum reductions (2 x 32 warps)
+    extern __shared__ float smem[];  // per-warp max, sum, and label buffers
     float* s_max_buf = smem;
-    float* s_sum_buf = smem + 32;
+    float* s_sum_buf = smem + 8;
+    float* s_lbl_buf = smem + 16;
 
     int row  = blockIdx.x;
     int base = row * Vpad;
-    int lbl  = __ldg(labels + row);
     int BLOCK = blockDim.x;
-    float scale = 1.0f / (float)NT;
+    int t = row % T;
+
+    // Sequence boundary: final token of each sequence has no target in causal LM.
+    // Zero the in-place gradient row for the final token in each sequence.
+    if (t == T - 1) {
+        for (int v = threadIdx.x; v < Vpad; v += BLOCK) {
+            logits[base + v] = __float2bfloat16(0.0f);
+        }
+        return;
+    }
+
+    // Within-sequence target token: tok_ids[row + 1] (strictly within the same sequence)
+    int lbl = __ldg(tok_ids + row + 1);
+    float scale = 1.0f / ((float)B * (float)(T - 1) * (float)accum_steps);
 
     // Pass 1a: parallel max
     float row_max = -FLT_MAX;
@@ -329,7 +341,10 @@ __global__ void online_xent_bwd_kernel(
         if (v == lbl) lbl_logit = lv;
     }
     sum_exp = warp_reduce_sum(sum_exp);
-    lbl_logit += warp_reduce_sum(lbl_logit);  // broadcast label logit (only one thread has it)
+    lbl_logit = warp_reduce_sum(lbl_logit);
+    if ((threadIdx.x & 31) == 0) {
+        s_lbl_buf[threadIdx.x >> 5] = lbl_logit;
+    }
     if ((threadIdx.x & 31) == 0) {
         s_sum_buf[threadIdx.x >> 5] = sum_exp;
     }
@@ -343,6 +358,15 @@ __global__ void online_xent_bwd_kernel(
     __syncthreads();
     sum_exp = s_sum_buf[0];
 
+    if (threadIdx.x < 32) {
+        int nw = (BLOCK + 31) / 32;
+        float l = (threadIdx.x < nw) ? s_lbl_buf[threadIdx.x] : 0.0f;
+        l = warp_reduce_sum(l);
+        if (threadIdx.x == 0) s_lbl_buf[0] = l;
+    }
+    __syncthreads();
+    lbl_logit = s_lbl_buf[0];
+
     float log_z = logf(sum_exp + 1e-8f);
     if (threadIdx.x == 0) {
         float row_loss = -(lbl_logit - log_z);
@@ -355,18 +379,18 @@ __global__ void online_xent_bwd_kernel(
         float lv = __bfloat162float(__ldg(logits + base + v)) - row_max;
         float sm = expf(lv) * inv_Z;
         float g  = (sm - (float)(v == lbl)) * scale;
-        d_logits[base + v] = __float2bfloat16(g);
+        logits[base + v] = __float2bfloat16(g);
     }
 }
 
 void launch_online_xent_bwd(
-    const bf16* logits, const int* labels,
-    bf16* d_logits, float* loss,
-    int NT, int Vpad, cudaStream_t s
+    bf16* logits, const int* tok_ids, float* loss,
+    int B, int T, int Vpad, int accum_steps, int ustep, cudaStream_t s
 ) {
-    cudaMemsetAsync(loss, 0, sizeof(float), s);
+    if (ustep == 0) cudaMemsetAsync(loss, 0, sizeof(float), s);
+    int NT = B * T;
     size_t smem = 64 * sizeof(float);  // 2×32 for max+sum reductions
-    online_xent_bwd_kernel<<<NT, 256, smem, s>>>(logits, labels, d_logits, loss, NT, Vpad);
+    online_xent_bwd_kernel<<<NT, 256, smem, s>>>(logits, tok_ids, loss, B, T, Vpad, accum_steps);
     CUDA_CHECK_LAST();
 }
 

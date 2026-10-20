@@ -53,9 +53,6 @@ namespace hw {
     constexpr int   VRAM_MB           = 12288;
     constexpr int   COMPUTE_MAJOR     = 12;
     constexpr int   COMPUTE_MINOR     = 0;
-    // L2 pinning budget: leave 24 MB free for cuBLASLt workspace staging
-    // Pin: layer_x (2MB) + layer_x2 (2MB) + attn_state (0.5MB) = 4.5MB hot path
-    constexpr long  L2_PIN_BUDGET     = 24LL * 1024 * 1024;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,9 +95,11 @@ struct JarvisRuntime {
 
     cudaDeviceProp  props        = {};
     int             device_id    = 0;
+    size_t          persisting_cache_size = 0;
 
     void init(int device = 0);
     void destroy();
+    void set_persisting_window(void* base, size_t bytes);
 
     // Graph lifecycle
     void begin_graph_capture();     // Call after uncaptured warmup steps

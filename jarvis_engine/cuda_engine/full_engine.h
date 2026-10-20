@@ -12,6 +12,7 @@ struct JarvisEngine {
     JarvisWorkspace ws;
     int             step_count    = 0;
     bool            graph_captured = false;
+    bool            fp8_weights_ready = false;
 
     // RoPE sinusoidal tables
     float* rope_cos    = nullptr;

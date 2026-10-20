@@ -9,6 +9,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <vector>
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 // ---------------------------------------------------------------------------
@@ -21,6 +22,11 @@ static void dev_alloc_bf16(bf16** p, size_t n, const char* tag = nullptr) {
     cudaMemset(*p, 0, bytes);
     if (tag) printf("  [alloc] %-35s  %9zu elems  %7.2f MB\n",
                      tag, n, bytes / 1048576.0);
+}
+
+static bool sparse_moe_requested_alloc() {
+    const char* v = std::getenv("JARVIS_MOE_SPARSE");
+    return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
 }
 
 static void dev_alloc_fp32(float** p, size_t n, const char* tag = nullptr) {
@@ -190,13 +196,17 @@ void alloc_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     const int T   = cfg.seq_len;
     const int NT  = B * T;
     const int NTK = NT * K;
+    const size_t route_rows = sparse_moe_requested_alloc() ? (size_t)NTK : (size_t)E * NT;
 
     printf("[alloc_workspace] Allocating training workspace...\n");
 
     dev_alloc_i32 (&ws.token_ids,    (size_t)NT * cfg.accum_steps + 1, "token_ids");
+    // Capture and warmup execute before the first host batch is copied in.
+    // Zero is a valid vocabulary ID and prevents undefined embedding reads.
+    CUDA_CHECK(cudaMemset(ws.token_ids, 0, ((size_t)NT * cfg.accum_steps + 1) * sizeof(int)));
     dev_alloc_bf16(&ws.tok_emb_out,  (size_t)NT * C,     "tok_emb_out");
 
-    // Hot path activations — two buffers L2-pinned
+    // Hot path activations; layer_x receives the L2 persisting access window.
     dev_alloc_bf16(&ws.layer_x,      (size_t)NT * C,     "layer_x [L2-hot]");
     dev_alloc_bf16(&ws.layer_x2,     (size_t)NT * C,     "layer_x2 [L2-hot]");
 
@@ -206,7 +216,7 @@ void alloc_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     dev_alloc_bf16(&ws.k_buf,        (size_t)B * H * T * D, "k_buf");
     dev_alloc_bf16(&ws.v_buf,        (size_t)B * H * T * D, "v_buf");
 
-    // attn_state is O(BHD^2) not O(T) — stays in L2
+    // attn_state is O(BHD^2), not O(T).
     dev_alloc_bf16(&ws.attn_state,   (size_t)B * H * D * D, "attn_state [L2-hot]");
     dev_alloc_bf16(&ws.attn_out,     (size_t)NT * C,     "attn_out");
 
@@ -215,9 +225,21 @@ void alloc_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     dev_alloc_fp32(&ws.router_probs, (size_t)NT * E,     "router_probs FP32");
     dev_alloc_i32 (&ws.topk_idx,     (size_t)NT * K,     "topk_idx");
     dev_alloc_fp32(&ws.topk_gates,   (size_t)NT * K,     "topk_gates FP32");
-    dev_alloc_bf16(&ws.dispatch_x,   (size_t)NTK * C,    "dispatch_x");
-    dev_alloc_bf16(&ws.layer_h1,     (size_t)E * NT * hi, "layer_h1 [E,NT,hi]");
-    dev_alloc_bf16(&ws.expert_out,   (size_t)E * NT * C,  "expert_out [E,NT,C]");
+    dev_alloc_i32 (&ws.route_pos,    (size_t)NT * K,     "route_pos");
+    dev_alloc_i32 (&ws.expert_counts, (size_t)E,          "expert_counts");
+    dev_alloc_i32 (&ws.expert_offsets, (size_t)E + 1,     "expert_offsets");
+    dev_alloc_i32 (&ws.route_write, (size_t)E,             "route_write");
+    if (sparse_moe_requested_alloc()) {
+        dev_alloc_fp32(&ws.route_probs_cache, (size_t)cfg.accum_steps * L * NT * E, "route_probs_cache [A,L,NT,E]");
+        dev_alloc_i32(&ws.topk_idx_cache, (size_t)cfg.accum_steps * L * NT * K, "topk_idx_cache [A,L,NT,K]");
+        dev_alloc_fp32(&ws.topk_gates_cache, (size_t)cfg.accum_steps * L * NT * K, "topk_gates_cache [A,L,NT,K]");
+        dev_alloc_i32(&ws.route_pos_cache, (size_t)cfg.accum_steps * L * NT * K, "route_pos_cache [A,L,NT,K]");
+        dev_alloc_i32(&ws.expert_counts_cache, (size_t)cfg.accum_steps * L * E, "expert_counts_cache [A,L,E]");
+        dev_alloc_i32(&ws.expert_offsets_cache, (size_t)cfg.accum_steps * L * (E + 1), "expert_offsets_cache [A,L,E+1]");
+    }
+    dev_alloc_bf16(&ws.dispatch_x,   route_rows * C,     sparse_moe_requested_alloc() ? "dispatch_x [NTK,C] compact" : "dispatch_x [E,NT,C]");
+    dev_alloc_bf16(&ws.layer_h1,     route_rows * hi,    sparse_moe_requested_alloc() ? "layer_h1 [NTK,hi] compact" : "layer_h1 [E,NT,hi]");
+    dev_alloc_bf16(&ws.expert_out,   route_rows * C,     sparse_moe_requested_alloc() ? "expert_out [NTK,C] compact" : "expert_out [E,NT,C]");
     dev_alloc_bf16(&ws.moe_out,      (size_t)NT * C,     "moe_out");
     dev_alloc_fp32(&ws.lsf_alpha,    1,                  "lsf_alpha scalar");
     dev_alloc_bf16(&ws.lsf_h,        (size_t)L * B * C,  "lsf_h [L,B,C]");
@@ -228,10 +250,7 @@ void alloc_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
 
     // Backward stash
     dev_alloc_bf16(&ws.stash_x,      (size_t)L * NT * C, "stash_x [L,NT,C]");
-    dev_alloc_bf16(&ws.stash_x2,     (size_t)8,          "stash_x2 (unused)");
-    dev_alloc_fp32(&ws.stash_rsqrt1, (size_t)8,          "stash_rsqrt1 (unused)");
-    dev_alloc_fp32(&ws.stash_rsqrt2, (size_t)8,          "stash_rsqrt2 (unused)");
-    dev_alloc_bf16(&ws.stash_h1,     (size_t)E * NT * hi, "stash_h1 scratch [E,NT,hi]");
+    dev_alloc_bf16(&ws.stash_h1,     route_rows * hi, "stash_h1 route workspace");
 
     // FP8 weight caches (one uint8 byte per element, allocated per-layer)
     auto alloc_u8_arr = [&](uint8_t**& arr, size_t n_each) {
@@ -254,15 +273,14 @@ void alloc_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
            ((size_t)3*C*C + C*C + E*hi*C + E*C*hi) * L / 1048576);
 
     // Grad buffers
-    dev_alloc_bf16(&ws.d_logits,     (size_t)NT * Vp,    "d_logits");
     dev_alloc_bf16(&ws.d_x,          (size_t)NT * C,     "d_x");
     dev_alloc_bf16(&ws.d_norm1,      (size_t)NT * C,     "d_norm1");
     dev_alloc_bf16(&ws.d_qkv,        (size_t)NT * 3 * C, "d_qkv");
     dev_alloc_bf16(&ws.d_attn_out,   (size_t)NT * C,     "d_attn_out");
     dev_alloc_bf16(&ws.d_norm2,      (size_t)NT * C,     "d_norm2");
     dev_alloc_bf16(&ws.d_moe,        (size_t)NT * C,     "d_moe");
-    dev_alloc_bf16(&ws.d_dispatch,   (size_t)E * NT * C,  "d_dispatch [E,NT,C]");
-    dev_alloc_bf16(&ws.d_h1,         (size_t)E * NT * hi, "d_h1 [E,NT,hi]");
+    dev_alloc_bf16(&ws.d_dispatch,   route_rows * C,     "d_dispatch route workspace");
+    dev_alloc_bf16(&ws.d_h1,         route_rows * hi,    "d_h1 route workspace");
     dev_alloc_fp32(&ws.dg,           (size_t)NT * 2,      "dg");
     dev_alloc_bf16(&ws.d_rlogits,    (size_t)NT * E,      "d_rlogits");
     dev_alloc_fp32(&ws.d_final_norm_f, (size_t)C,         "d_final_norm_f");
@@ -274,6 +292,8 @@ void alloc_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     ws.d_exp_w2  = new bf16*[L]();
     ws.d_norm1_w = new bf16*[L]();
     ws.d_norm2_w = new bf16*[L]();
+    ws.d_norm1_f = new float*[L]();
+    ws.d_norm2_f = new float*[L]();
     ws.d_gamma   = new float*[L]();
     ws.d_router_w = new bf16*[L]();
 
@@ -284,6 +304,8 @@ void alloc_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
         dev_alloc_bf16(&ws.d_exp_w2[l], (size_t)E * C * hi);
         dev_alloc_bf16(&ws.d_norm1_w[l],(size_t)C);
         dev_alloc_bf16(&ws.d_norm2_w[l],(size_t)C);
+        dev_alloc_fp32(&ws.d_norm1_f[l],(size_t)C);
+        dev_alloc_fp32(&ws.d_norm2_f[l],(size_t)C);
         dev_alloc_fp32(&ws.d_gamma[l],  (size_t)H);
         dev_alloc_bf16(&ws.d_router_w[l], (size_t)C * E);
     }
@@ -298,6 +320,7 @@ void alloc_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     dev_alloc_fp32(&ws.d_bc1,        1,                "d_bc1 (bias_corr1)");
     dev_alloc_fp32(&ws.d_bc2,        1,                "d_bc2 (bias_corr2)");
     dev_alloc_fp32(&ws.d_clip_coef,  1,                "d_clip_coef");
+    dev_alloc_fp32(&ws.d_lr,         1,                "d_lr (scheduled lr)");
 
     printf("[alloc_workspace] Done.\n");
 }
@@ -317,11 +340,13 @@ void free_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     FD(ws.attn_state);FD(ws.attn_out);
     FD(ws.norm2_out); FD(ws.router_logits);
     FD(ws.router_probs); FD(ws.topk_idx); FD(ws.topk_gates);
+    FD(ws.route_pos); FD(ws.expert_counts); FD(ws.expert_offsets); FD(ws.route_write);
+    FD(ws.route_probs_cache); FD(ws.topk_idx_cache); FD(ws.topk_gates_cache);
+    FD(ws.route_pos_cache); FD(ws.expert_counts_cache); FD(ws.expert_offsets_cache);
     FD(ws.dispatch_x);FD(ws.layer_h1); FD(ws.expert_out); FD(ws.moe_out);
     FD(ws.lsf_alpha); FD(ws.lsf_h);   FD(ws.lsf_out);
     FD(ws.logits);    FD(ws.loss);
-    FD(ws.stash_x);   FD(ws.stash_x2);
-    FD(ws.stash_rsqrt1); FD(ws.stash_rsqrt2); FD(ws.stash_h1);
+    FD(ws.stash_x);   FD(ws.stash_h1);
 
     auto fl_u8 = [&](uint8_t** arr) {
         if (!arr) return;
@@ -342,7 +367,7 @@ void free_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     // FP8 weight caches
     fl_u8(ws.qkv_q8); fl_u8(ws.out_q8); fl_u8(ws.w1_q8); fl_u8(ws.w2_q8);
     fl_fp32(ws.qkv_inv); fl_fp32(ws.out_inv); fl_fp32(ws.w1_inv); fl_fp32(ws.w2_inv);
-    FD(ws.d_logits);  FD(ws.d_x);    FD(ws.d_norm1);
+    FD(ws.d_x);       FD(ws.d_norm1);
     FD(ws.d_qkv);     FD(ws.d_attn_out); FD(ws.d_norm2);
     FD(ws.d_moe);     FD(ws.d_dispatch); FD(ws.d_h1);
     FD(ws.d_tok_emb); FD(ws.d_final_norm); FD(ws.d_final_norm_f); FD(ws.dg); FD(ws.d_rlogits);
@@ -352,12 +377,14 @@ void free_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     FD(ws.d_bc1);
     FD(ws.d_bc2);
     FD(ws.d_clip_coef);
+    FD(ws.d_lr);
 
     #undef FD
 
     fl_bf16(ws.d_qkv_w);   fl_bf16(ws.d_out_w);
     fl_bf16(ws.d_exp_w1);  fl_bf16(ws.d_exp_w2);
     fl_bf16(ws.d_norm1_w); fl_bf16(ws.d_norm2_w); fl_bf16(ws.d_router_w);
+    fl_fp32(ws.d_norm1_f); fl_fp32(ws.d_norm2_f);
     fl_fp32(ws.d_gamma);
 
     memset(&ws, 0, sizeof(ws));
@@ -386,6 +413,8 @@ void zero_grad_buffers(JarvisWorkspace& ws, const JarvisConfig& cfg, cudaStream_
         cudaMemsetAsync(ws.d_exp_w2[l], 0, E*C*hi*sizeof(bf16),    s);
         cudaMemsetAsync(ws.d_norm1_w[l],0, C*sizeof(bf16),          s);
         cudaMemsetAsync(ws.d_norm2_w[l],0, C*sizeof(bf16),          s);
+        cudaMemsetAsync(ws.d_norm1_f[l],0, C*sizeof(float),         s);
+        cudaMemsetAsync(ws.d_norm2_f[l],0, C*sizeof(float),         s);
         cudaMemsetAsync(ws.d_gamma[l],  0, H*sizeof(float),         s);
     }
     cudaMemsetAsync(ws.d_tok_emb,    0, Vp*C*sizeof(bf16),          s);

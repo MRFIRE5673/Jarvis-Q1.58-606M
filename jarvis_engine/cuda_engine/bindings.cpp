@@ -39,7 +39,8 @@ static void py_init(
     float weight_decay, float grad_clip,
     float balance_alpha, float reflect_lambda,
     float lsf_alpha_min, float lsf_alpha_max,
-    int device
+    int device,
+    int warmup_steps, int decay_steps, float min_lr_ratio
 ) {
     JarvisConfig cfg;
     cfg.batch_size    = batch_size;
@@ -65,6 +66,9 @@ static void py_init(
     cfg.reflect_lambda= reflect_lambda;
     cfg.lsf_alpha_min = lsf_alpha_min;
     cfg.lsf_alpha_max = lsf_alpha_max;
+    cfg.warmup_steps  = warmup_steps;
+    cfg.decay_steps   = decay_steps;
+    cfg.min_lr_ratio  = min_lr_ratio;
     cfg.device        = device;
     get_engine().init(cfg, device);
 }
@@ -157,6 +161,7 @@ static void py_load_weight_np(const std::string& key, const py::array_t<float>& 
     size_t n = buf.size;
 
     auto& e = get_engine();
+    e.fp8_weights_ready = false;
     auto& p = e.params;
     const auto& cfg = e.cfg;
 
@@ -228,7 +233,7 @@ Usage:
 
     m.def("init", &py_init,
           "Initialize engine with explicit config",
-          py::arg("batch_size")=4, py::arg("seq_len")=512,
+          py::arg("batch_size")=8, py::arg("seq_len")=512,
           py::arg("d_model")=1024, py::arg("n_heads")=16, py::arg("n_layers")=24,
           py::arg("n_experts")=4, py::arg("top_k")=2, py::arg("expert_hidden")=2048,
           py::arg("vocab_size")=50257, py::arg("vocab_padded")=50304,
@@ -237,7 +242,9 @@ Usage:
           py::arg("eps")=1e-8f, py::arg("weight_decay")=0.01f, py::arg("grad_clip")=1.0f,
           py::arg("balance_alpha")=0.01f, py::arg("reflect_lambda")=0.01f,
           py::arg("lsf_alpha_min")=0.1f, py::arg("lsf_alpha_max")=0.99f,
-          py::arg("device")=0);
+          py::arg("device")=0,
+          py::arg("warmup_steps")=100, py::arg("decay_steps")=10000,
+          py::arg("min_lr_ratio")=0.1f);
 
     m.def("init_default",   &py_init_default,  "Init with default Jarvis config", py::arg("device")=0);
     m.def("warmup",         &py_warmup,        "Warmup steps before graph capture", py::arg("n_steps")=3);

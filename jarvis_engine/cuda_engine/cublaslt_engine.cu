@@ -24,6 +24,7 @@
 #include <cublas_v2.h>
 #include <stdexcept>
 #include <cstdio>
+#include <vector>
 
 #define CUBLAS_CHECK(call)                                                         \
     do {                                                                           \
@@ -169,10 +170,9 @@ void CublasLtEngine::gemm_fp8_ex(int M, int N, int K, const bf16* X, const bf16*
 // gemm_fp8_cached: W already quantized in W_q8 (E4M3, [N,K] row-major), d_inv_w device ptr to inv scale.
 // Quantizes X (E4M3) on the fly. C[M,N] = X[M,K] * W[N,K]^T.
 void CublasLtEngine::gemm_fp8_cached(int M, int N, int K,
-                                      const bf16* X, const uint8_t* W_q8,
-                                      const float* d_inv_w, bf16* Y, cudaStream_t s) const {
-    quant_fp8(X, x8, M, K, false, 0, f8_stat + 0, f8_stat + 2, s);
-
+                                      const bf16* X, const bf16* W_bf16,
+                                      const uint8_t* W_q8, const float* d_inv_w,
+                                      bf16* Y, cudaStream_t s) const {
     cublasLtMatmulDesc_t op;
     CUBLAS_CHECK((cublasStatus_t)cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
     cublasOperation_t T = CUBLAS_OP_T, Nn = CUBLAS_OP_N;
@@ -188,20 +188,109 @@ void CublasLtEngine::gemm_fp8_cached(int M, int N, int K,
     cublasLtMatrixLayoutCreate(&lb, CUDA_R_8F_E4M3, K, M, K);
     cublasLtMatrixLayoutCreate(&lc, CUDA_R_16BF, N, M, N);
 
-    cublasLtMatmulPreference_t pref;
-    cublasLtMatmulPreferenceCreate(&pref);
+    const auto key = std::make_tuple(M, N, K);
+    auto cached = fp8_algo_cache.find(key);
+    cublasLtMatmulAlgo_t algo{};
+    bool has_algo = false;
     size_t wsz = 32u << 20;
-    cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsz, sizeof(wsz));
-    cublasLtMatmulHeuristicResult_t r; int n = 0;
-    cublasLtMatmulAlgoGetHeuristic(lt, op, la, lb, lc, lc, pref, 1, &r, &n);
-    if (!n) throw std::runtime_error("[cuBLASLt] no FP8 algo (cached)");
+    if (cached != fp8_algo_cache.end()) {
+        algo = cached->second.algo;
+        has_algo = cached->second.valid;
+    } else {
+        cublasLtMatmulPreference_t pref;
+        CUBLAS_CHECK((cublasStatus_t)cublasLtMatmulPreferenceCreate(&pref));
+        CUBLAS_CHECK((cublasStatus_t)cublasLtMatmulPreferenceSetAttribute(
+            pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsz, sizeof(wsz)));
+        cublasLtMatmulHeuristicResult_t r{}; int n = 0;
+        CUBLAS_CHECK((cublasStatus_t)cublasLtMatmulAlgoGetHeuristic(
+            lt, op, la, lb, lc, lc, pref, 1, &r, &n));
+        cublasLtMatmulPreferenceDestroy(pref);
+        has_algo = n > 0;
+        if (has_algo) algo = r.algo;
+        fp8_algo_cache.emplace(key, Fp8AlgoCacheEntry{algo, has_algo});
+    }
+    if (!has_algo) {
+        cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(lc);
+        cublasLtMatmulDescDestroy(op);
+        // Small dynamic expert batches can lack an FP8 algorithm; keep them on BF16.
+        gemm({M, N, K}, X, W_bf16, Y, 1.f, 0.f, s);
+        return;
+    }
+
+    quant_fp8(X, x8, M, K, false, 0, f8_stat + 0, f8_stat + 2, s);
 
     float alpha = 1.f, beta = 0.f;
     CUBLAS_CHECK((cublasStatus_t)cublasLtMatmul(lt, op, &alpha, W_q8, la, x8, lb, &beta,
-                                                Y, lc, Y, lc, &r.algo, lt_ws, wsz, s));
+                                                Y, lc, Y, lc, &algo, lt_ws, wsz, s));
+    cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(lc);
+    cublasLtMatmulDescDestroy(op);
+}
+
+bool CublasLtEngine::grouped_expert_bf16(const bf16* X, const bf16* W, bf16* Y,
+                                         const int* counts, const int* offsets,
+                                         int E, int N, int K, cudaStream_t s) const {
+    if (!grouped_supported) return false;
+    if (E <= 0 || E > grouped_capacity) return false;
+    std::vector<void*> ptrs((size_t)E * 3);
+    std::vector<int> dims((size_t)E * 7);
+    int* a_rows = dims.data() + 0 * E, *a_cols = dims.data() + 1 * E, *a_ld = dims.data() + 2 * E;
+    int* b_rows = dims.data() + 3 * E, *b_ld = dims.data() + 4 * E;
+    int* c_rows = dims.data() + 5 * E, *c_ld = dims.data() + 6 * E;
+    for (int e = 0; e < E; ++e) {
+        ptrs[e] = (void*)(W + (size_t)e * N * K);
+        ptrs[E + e] = (void*)(X + (size_t)offsets[e] * K);
+        ptrs[2 * E + e] = (void*)(Y + (size_t)offsets[e] * N);
+        a_rows[e] = K; a_cols[e] = N; a_ld[e] = K;
+        b_rows[e] = K; b_ld[e] = K;
+        c_rows[e] = N; c_ld[e] = N;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(grouped_ptrs_dev, ptrs.data(), ptrs.size() * sizeof(void*),
+                               cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(grouped_dims_dev, dims.data(), dims.size() * sizeof(int),
+                               cudaMemcpyHostToDevice, s));
+
+    cublasLtMatrixLayout_t la, lb, lc;
+    CUBLAS_CHECK((cublasStatus_t)cublasLtGroupedMatrixLayoutCreate(
+        &la, CUDA_R_16BF, E, grouped_dims_dev + 0 * E,
+        grouped_dims_dev + 1 * E, grouped_dims_dev + 2 * E));
+    CUBLAS_CHECK((cublasStatus_t)cublasLtGroupedMatrixLayoutCreate(
+        &lb, CUDA_R_16BF, E, grouped_dims_dev + 3 * E,
+        counts, grouped_dims_dev + 4 * E));
+    CUBLAS_CHECK((cublasStatus_t)cublasLtGroupedMatrixLayoutCreate(
+        &lc, CUDA_R_16BF, E, grouped_dims_dev + 5 * E,
+        counts, grouped_dims_dev + 6 * E));
+
+    cublasLtMatmulDesc_t op;
+    CUBLAS_CHECK((cublasStatus_t)cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    cublasOperation_t T = CUBLAS_OP_T, Nn = CUBLAS_OP_N;
+    CUBLAS_CHECK((cublasStatus_t)cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &T, sizeof(T)));
+    CUBLAS_CHECK((cublasStatus_t)cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &Nn, sizeof(Nn)));
+
+    cublasLtMatmulPreference_t pref;
+    CUBLAS_CHECK((cublasStatus_t)cublasLtMatmulPreferenceCreate(&pref));
+    size_t wsz = 32u << 20;
+    CUBLAS_CHECK((cublasStatus_t)cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsz, sizeof(wsz)));
+    cublasLtMatmulHeuristicResult_t r{}; int n = 0;
+    cublasStatus_t hs = (cublasStatus_t)cublasLtMatmulAlgoGetHeuristic(lt, op, la, lb, lc, lc, pref, 1, &r, &n);
+    if (hs != CUBLAS_STATUS_SUCCESS || !n) {
+        grouped_supported = false;
+        cublasLtMatmulPreferenceDestroy(pref);
+        cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(lc);
+        cublasLtMatmulDescDestroy(op);
+        return false;
+    }
+    float alpha = 1.f, beta = 0.f;
+    CUBLAS_CHECK((cublasStatus_t)cublasLtMatmul(
+        lt, op, &alpha, grouped_ptrs_dev, la,
+        (char*)grouped_ptrs_dev + (size_t)E * sizeof(void*), lb,
+        &beta, (char*)grouped_ptrs_dev + (size_t)2 * E * sizeof(void*), lc,
+        (char*)grouped_ptrs_dev + (size_t)2 * E * sizeof(void*), lc,
+        &r.algo, lt_ws, wsz, s));
     cublasLtMatmulPreferenceDestroy(pref);
     cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(lc);
     cublasLtMatmulDescDestroy(op);
+    return true;
 }
 
 
@@ -213,12 +302,26 @@ CublasLtEngine& get_cublaslt() { return g_cublaslt; }
 // init — create cuBLAS handle, enable tensor ops
 // ---------------------------------------------------------------------------
 void CublasLtEngine::init(const JarvisConfig& cfg) {
+    fp8_algo_cache.clear();
     CUBLAS_CHECK(cublasCreate(&handle));
     CUBLAS_CHECK((cublasStatus_t)cublasLtCreate(&lt));
     cudaMalloc(&lt_ws, 32u << 20);
     cudaMalloc(&x8, 16u << 20);
     cudaMalloc(&w8, 16u << 20);
     cudaMalloc(&f8_stat, 4 * sizeof(float));
+    grouped_capacity = cfg.n_experts;
+    cudaMalloc(&grouped_ptrs_dev, (size_t)grouped_capacity * 3 * sizeof(void*));
+    cudaMalloc(&grouped_dims_dev, (size_t)grouped_capacity * 7 * sizeof(int));
+    int device = 0;
+    cudaDeviceProp props{};
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaGetDeviceProperties(&props, device));
+    // The experimental cuBLASLt grouped GEMM is unsupported on SM120 in the
+    // deployed CUDA stack. Keep its BF16 dispatch off there; sparse MoE uses
+    // the validated cached-FP8 per-expert path instead.
+    grouped_supported = !(props.major == 12 && props.minor == 0);
+    if (!grouped_supported)
+        printf("[cuBLAS] Grouped expert GEMM disabled on SM120; using sparse FP8 fallback.\n");
     // SM120 peak: enable TensorCore for all ops, allow implicit type conversion
     CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
     printf("[cuBLAS] Init OK. Handle ready for SM120 BF16 TensorCore (TF32_TENSOR_OP_MATH).\n");
@@ -226,6 +329,14 @@ void CublasLtEngine::init(const JarvisConfig& cfg) {
 }
 
 void CublasLtEngine::destroy() {
+    fp8_algo_cache.clear();
+    if (grouped_ptrs_dev) { cudaFree(grouped_ptrs_dev); grouped_ptrs_dev = nullptr; }
+    if (grouped_dims_dev) { cudaFree(grouped_dims_dev); grouped_dims_dev = nullptr; }
+    if (f8_stat) { cudaFree(f8_stat); f8_stat = nullptr; }
+    if (x8) { cudaFree(x8); x8 = nullptr; }
+    if (w8) { cudaFree(w8); w8 = nullptr; }
+    if (lt_ws) { cudaFree(lt_ws); lt_ws = nullptr; }
+    if (lt) { cublasLtDestroy(lt); lt = nullptr; }
     if (handle) { cublasDestroy(handle); handle = nullptr; }
 }
 

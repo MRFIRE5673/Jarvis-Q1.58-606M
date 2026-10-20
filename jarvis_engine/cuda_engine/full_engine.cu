@@ -24,6 +24,13 @@
 #include <fstream>
 #include <vector>
 #include <cstring>
+#include <string>
+#include <cstdio>
+#include <cstdlib>
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // Extern declarations — each defined in its own .cu translation unit
@@ -35,7 +42,7 @@ extern void launch_fused_add_rmsnorm_fwd(const bf16*, const bf16*, const bf16*,
                                           bf16*, float*, int, int, float, cudaStream_t);
 extern void launch_fused_stash_add_rmsnorm_fwd(const bf16*, const bf16*, const bf16*,
                                                 bf16*, bf16*, float*, int, int, float, cudaStream_t);
-extern void launch_online_xent_bwd(const bf16*, const int*, bf16*, float*, int, int, cudaStream_t);
+extern void launch_online_xent_bwd(bf16*, const int*, float*, int, int, int, int, int, cudaStream_t);
 extern void launch_add_residual(const bf16*, const bf16*, bf16*, int, cudaStream_t);
 extern void launch_grad_norm_sq(const bf16*, float*, int, cudaStream_t);
 extern void launch_compute_clip_coef(const float*, float*, float, cudaStream_t);
@@ -49,8 +56,10 @@ extern void launch_assoc_attn_fwd(const bf16*, const bf16*, const bf16*, const f
                                    bf16*, bf16*, int, int, int, int, int, cudaStream_t);
 
 // moe.cu
-extern void launch_top2_gating(const bf16*, float*, int*, float*, int, int, cudaStream_t);
 extern void launch_dispatch_gather(const bf16*, const int*, bf16*, int, int, int, cudaStream_t);
+extern void launch_sparse_dispatch(const bf16*, const int*, bf16*, int*, int*, const int*, int, int, int, int, cudaStream_t);
+extern void launch_sparse_combine_fwd(const bf16*, const bf16*, const int*, const int*, const int*, const float*, bf16*, int, int, int, cudaStream_t);
+extern void launch_sparse_combine_bwd(const bf16*, const bf16*, const int*, const int*, const int*, const float*, bf16*, float*, int, int, int, cudaStream_t);
 extern void launch_gelu_fwd_inplace(bf16*, int, cudaStream_t);
 extern void launch_gelu_fwd_stash(const bf16*, bf16*, bf16*, int, cudaStream_t);
 extern void launch_gelu_bwd(const bf16*, const bf16*, bf16*, int, cudaStream_t);
@@ -67,6 +76,7 @@ extern void launch_reflective_penalty(const bf16*, float*, float*, float, float,
 // ternary.cu (launchers only — NOT #included)
 extern void launch_ternary_abs_mean(const float*, float*, int, cudaStream_t);
 extern void launch_ternary_quantize(const float*, const float*, bf16*, int, cudaStream_t);
+extern void launch_ternary_ste_mask(const float*, const float*, bf16*, int, cudaStream_t);
 
 // backward.cu
 extern void launch_grad_accum(const bf16*, bf16*, float, int, cudaStream_t);
@@ -100,6 +110,25 @@ static void quantize_weight(float* fp32, float* alpha_scratch,
                              bf16* bf16_out, int N, cudaStream_t s) {
     launch_ternary_abs_mean(fp32, alpha_scratch, N, s);
     launch_ternary_quantize(fp32, alpha_scratch, bf16_out, N, s);
+}
+
+static bool sparse_moe_enabled() {
+    const char* v = std::getenv("JARVIS_MOE_SPARSE");
+    return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
+}
+
+static float router_noise_std() {
+    const char* v = std::getenv("JARVIS_PAPER_FIDELITY");
+    return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y') ? 0.1f : 0.0f;
+}
+
+static std::vector<int> read_expert_counts(JarvisWorkspace& ws, int experts,
+                                           cudaStream_t stream) {
+    std::vector<int> counts((size_t)experts);
+    CUDA_CHECK(cudaMemcpyAsync(counts.data(), ws.expert_counts,
+                               (size_t)experts * sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return counts;
 }
 
 // ===========================================================================
@@ -410,33 +439,67 @@ static void layer_core(JarvisEngine& E, int l, const bf16* xin) {
     cudaStream_t s = get_runtime().get_stream();
     const int NT = cfg.NT(), C = cfg.d_model, H = cfg.n_heads, D = cfg.head_dim;
     const int Ee = cfg.n_experts, hi = cfg.expert_hidden, B = cfg.batch_size, T = cfg.seq_len;
-    bf16* x2 = ws.dispatch_x;
+    bf16* x2 = ws.layer_x2;
 
     // FP8 forward using pre-quantized weight cache (only activation is quantized per call)
     launch_rmsnorm_fwd(xin, P.norm1_w[l], ws.norm1_out, nullptr, NT, C, s);
-    lt.gemm_fp8_cached(NT, 3*C, C, ws.norm1_out, ws.qkv_q8[l], ws.qkv_inv[l], ws.qkv_out, s);
+    lt.gemm_fp8_cached(NT, 3*C, C, ws.norm1_out, P.qkv_w[l], ws.qkv_q8[l], ws.qkv_inv[l], ws.qkv_out, s);
     launch_attn_fwd2(ws.qkv_out, P.gamma_raw[l], E.rope_cos, E.rope_sin, ws.attn_out, ws.q_buf, ws.k_buf, B, H, T, D, C, s);
-    lt.gemm_fp8_cached(NT, C, C, ws.attn_out, ws.out_q8[l], ws.out_inv[l], ws.layer_x2, s);
+    lt.gemm_fp8_cached(NT, C, C, ws.attn_out, P.out_w[l], ws.out_q8[l], ws.out_inv[l], ws.layer_x2, s);
     launch_add_residual(xin, ws.layer_x2, x2, NT * C, s);
     launch_rmsnorm_fwd(x2, P.norm2_w[l], ws.norm2_out, nullptr, NT, C, s);
 
     lt.router_fwd(ws.norm2_out, P.router_w[l], ws.router_logits, NT, C, Ee, s);
-    launch_top2_gating(ws.router_logits, ws.router_probs, ws.topk_idx, ws.topk_gates, NT, Ee, s);
-
-    for (int e = 0; e < Ee; ++e) {
-        lt.gemm_fp8_cached(NT, hi, C, ws.norm2_out,
-                           ws.w1_q8[l] + (size_t)e * hi * C, ws.w1_inv[l],
-                           ws.layer_h1 + (size_t)e * NT * hi, s);
-        launch_gelu_fwd_stash(ws.layer_h1 + (size_t)e * NT * hi,
-                              ws.stash_h1 + (size_t)e * NT * hi,
-                              ws.layer_h1 + (size_t)e * NT * hi,
-                              NT * hi, s);
-        lt.gemm_fp8_cached(NT, C, hi,
-                           ws.layer_h1 + (size_t)e * NT * hi,
-                           ws.w2_q8[l] + (size_t)e * C * hi, ws.w2_inv[l],
-                           ws.expert_out + (size_t)e * NT * C, s);
+    if (sparse_moe_enabled()) {
+        CUDA_CHECK(cudaMemsetAsync(ws.expert_counts, 0, (size_t)Ee * sizeof(int), s));
+        launch_top2_gating_count(ws.router_logits, ws.router_probs, ws.topk_idx,
+                                 ws.topk_gates, ws.expert_counts, NT, Ee,
+                                 router_noise_std(), ws.adam_step, 0, s);
+        launch_expert_offsets(ws.expert_counts, ws.expert_offsets, Ee, s);
+        const std::vector<int> counts = read_expert_counts(ws, Ee, s);
+        launch_sparse_dispatch(ws.norm2_out, ws.topk_idx, ws.dispatch_x, ws.route_pos,
+                               ws.route_write, ws.expert_offsets, NT, cfg.top_k, Ee, C, s);
+        int offset = 0;
+        for (int e = 0; e < Ee; ++e) {
+            const int rows = counts[e];
+            if (rows > 0) {
+                bf16* h1 = ws.layer_h1 + (size_t)offset * hi;
+                bf16* pre = ws.stash_h1 + (size_t)offset * hi;
+                bf16* x = ws.dispatch_x + (size_t)offset * C;
+                lt.gemm_fp8_cached(rows, hi, C, x,
+                    P.expert_w1[l] + (size_t)e * hi * C,
+                    ws.w1_q8[l] + (size_t)e * hi * C, ws.w1_inv[l], h1, s);
+                launch_gelu_fwd_stash(h1, pre, h1, rows * hi, s);
+                lt.gemm_fp8_cached(rows, C, hi, h1,
+                    P.expert_w2[l] + (size_t)e * C * hi,
+                    ws.w2_q8[l] + (size_t)e * C * hi, ws.w2_inv[l],
+                    ws.expert_out + (size_t)offset * C, s);
+            }
+            offset += rows;
+        }
+        launch_sparse_combine_fwd(ws.expert_out, x2, ws.topk_idx, ws.route_pos,
+                                  ws.expert_offsets, ws.topk_gates, ws.moe_out,
+                                  NT, cfg.top_k, C, s);
+    } else {
+        launch_top2_gating(ws.router_logits, ws.router_probs, ws.topk_idx,
+                           ws.topk_gates, NT, Ee, router_noise_std(), ws.adam_step, 0, s);
+        for (int e = 0; e < Ee; ++e) {
+            lt.gemm_fp8_cached(NT, hi, C, ws.norm2_out,
+                               P.expert_w1[l] + (size_t)e * hi * C,
+                               ws.w1_q8[l] + (size_t)e * hi * C, ws.w1_inv[l],
+                               ws.layer_h1 + (size_t)e * NT * hi, s);
+            launch_gelu_fwd_stash(ws.layer_h1 + (size_t)e * NT * hi,
+                                  ws.stash_h1 + (size_t)e * NT * hi,
+                                  ws.layer_h1 + (size_t)e * NT * hi, NT * hi, s);
+            lt.gemm_fp8_cached(NT, C, hi,
+                               ws.layer_h1 + (size_t)e * NT * hi,
+                               P.expert_w2[l] + (size_t)e * C * hi,
+                               ws.w2_q8[l] + (size_t)e * C * hi, ws.w2_inv[l],
+                               ws.expert_out + (size_t)e * NT * C, s);
+        }
+        launch_moe_combine_fwd(ws.expert_out, x2, ws.topk_idx, ws.topk_gates,
+                               ws.moe_out, NT, C, s);
     }
-    launch_moe_combine_fwd(ws.expert_out, x2, ws.topk_idx, ws.topk_gates, ws.moe_out, NT, C, s);
 
 }
 
@@ -476,7 +539,7 @@ void JarvisEngine::forward_microstep(int ustep) {
 
     launch_rmsnorm_fwd(ws.layer_x, params.final_norm_w, ws.layer_x2, nullptr, NT, C, s);
     lt.lm_head(ws.layer_x2, params.tok_emb, ws.logits, NT, C, Vp, s);
-    launch_online_xent_bwd(ws.logits, tok_ids + 1, ws.d_logits, ws.loss, NT - 1, Vp, s);
+    launch_online_xent_bwd(ws.logits, tok_ids, ws.loss, B, T, Vp, cfg.accum_steps, ustep, s);
     launch_combine_aux_loss(ws.loss, ws.l_balance, ws.l_reflect, s);
 }
 
@@ -497,8 +560,8 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
     const int* tok_ids = ws.token_ids + (size_t)ustep * NT;
 
     // --- LM head + final norm ---
-    lt.lm_head_bwd_dx(ws.d_logits, params.tok_emb, ws.d_x, NT, C, Vp, s);
-    lt.lm_head_bwd_dw(ws.d_logits, ws.layer_x2, ws.d_tok_emb, NT, C, Vp, beta, s);
+    lt.lm_head_bwd_dx(ws.logits, params.tok_emb, ws.d_x, NT, C, Vp, s);
+    lt.lm_head_bwd_dw(ws.logits, ws.layer_x2, ws.d_tok_emb, NT, C, Vp, beta, s);
     if (ustep == 0) CUDA_CHECK(cudaMemsetAsync(ws.d_final_norm_f, 0, (size_t)C * sizeof(float), s));
     launch_rmsnorm_bwd(ws.layer_x, params.final_norm_w, ws.d_x, nullptr, ws.d_x,
                        ws.d_final_norm_f, NT, C, s);
@@ -519,27 +582,60 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
         // ws.d_moe = dm = grad wrt m (and, via the residual, wrt x2)
 
         // MoE combine backward -> per-expert dy, gate grads -> router logit grads
-        launch_moe_combine_bwd(ws.d_moe, ws.expert_out, ws.topk_idx, ws.topk_gates,
-                               ws.d_dispatch, ws.dg, NT, C, E, s);
-        launch_router_bwd2(ws.router_probs, ws.topk_idx, ws.dg, ws.d_rlogits, NT, s);
+        if (sparse_moe_enabled()) {
+            launch_sparse_combine_bwd(ws.d_moe, ws.expert_out, ws.topk_idx,
+                ws.route_pos, ws.expert_offsets, ws.topk_gates,
+                ws.d_dispatch, ws.dg, NT, cfg.top_k, C, s);
+            launch_router_bwd2(ws.router_probs, ws.topk_idx, ws.dg, ws.d_rlogits, NT, s);
+            const std::vector<int> counts = read_expert_counts(ws, E, s);
+            CUDA_CHECK(cudaMemsetAsync(ws.d_norm2, 0, (size_t)NT * C * sizeof(bf16), s));
+            int offset = 0;
+            bool first = true;
+            for (int e = 0; e < E; ++e) {
+                const int rows = counts[e];
+                if (rows > 0) {
+                    const bf16* dy_e = ws.d_dispatch + (size_t)offset * C;
+                    bf16* dh_e = ws.d_h1 + (size_t)offset * hi;
+                    const bf16* h1 = ws.layer_h1 + (size_t)offset * hi;
+                    const bf16* h1_pre = ws.stash_h1 + (size_t)offset * hi;
+                    lt.generic_bwd_dw(dy_e, h1, ws.d_exp_w2[l] + (size_t)e * C * hi,
+                                      C, hi, rows, beta, s);
+                    GemmDesc d1 = {rows, hi, C};
+                    lt.gemm_nn(d1, dy_e, params.expert_w2[l] + (size_t)e * C * hi,
+                               dh_e, 1.0f, 0.0f, s);
+                    launch_gelu_bwd(h1_pre, dh_e, dh_e, rows * hi, s);
+                    lt.generic_bwd_dw(dh_e, ws.norm2_out,
+                                      ws.d_exp_w1[l] + (size_t)e * hi * C,
+                                      hi, C, rows, beta, s);
+                    GemmDesc d2 = {rows, C, hi};
+                    lt.gemm_nn(d2, dh_e, params.expert_w1[l] + (size_t)e * hi * C,
+                               ws.d_norm2, 1.0f, first ? 0.0f : 1.0f, s);
+                    first = false;
+                }
+                offset += rows;
+            }
+        } else {
+            launch_moe_combine_bwd(ws.d_moe, ws.expert_out, ws.topk_idx, ws.topk_gates,
+                                   ws.d_dispatch, ws.dg, NT, C, E, s);
+            launch_router_bwd2(ws.router_probs, ws.topk_idx, ws.dg, ws.d_rlogits, NT, s);
 
-        // Experts: W2 grads, dH, GELU bwd, W1 grads, dn2 (interleaved per expert for L2 cache locality)
-        for (int e = 0; e < E; ++e) {
-            const bf16* dy_e = ws.d_dispatch + (size_t)e * NT * C;
-            lt.generic_bwd_dw(dy_e, ws.layer_h1 + (size_t)e * NT * hi,
-                              ws.d_exp_w2[l] + (size_t)e * C * hi, C, hi, NT, beta, s);
-            GemmDesc d1 = {NT, hi, C};
-            lt.gemm_nn(d1, dy_e, params.expert_w2[l] + (size_t)e * C * hi,
-                       ws.d_h1 + (size_t)e * NT * hi, 1.0f, 0.0f, s);
-            launch_gelu_bwd(ws.stash_h1 + (size_t)e * NT * hi,
-                            ws.d_h1 + (size_t)e * NT * hi,
-                            ws.d_h1 + (size_t)e * NT * hi,
-                            NT * hi, s);
-            const bf16* dh_e = ws.d_h1 + (size_t)e * NT * hi;
-            lt.generic_bwd_dw(dh_e, ws.norm2_out, ws.d_exp_w1[l] + (size_t)e * hi * C, hi, C, NT, beta, s);
-            GemmDesc d2 = {NT, C, hi};
-            lt.gemm_nn(d2, dh_e, params.expert_w1[l] + (size_t)e * hi * C,
-                       ws.d_norm2, 1.0f, (e == 0) ? 0.0f : 1.0f, s);
+            for (int e = 0; e < E; ++e) {
+                const bf16* dy_e = ws.d_dispatch + (size_t)e * NT * C;
+                lt.generic_bwd_dw(dy_e, ws.layer_h1 + (size_t)e * NT * hi,
+                                  ws.d_exp_w2[l] + (size_t)e * C * hi, C, hi, NT, beta, s);
+                GemmDesc d1 = {NT, hi, C};
+                lt.gemm_nn(d1, dy_e, params.expert_w2[l] + (size_t)e * C * hi,
+                           ws.d_h1 + (size_t)e * NT * hi, 1.0f, 0.0f, s);
+                launch_gelu_bwd(ws.stash_h1 + (size_t)e * NT * hi,
+                                ws.d_h1 + (size_t)e * NT * hi,
+                                ws.d_h1 + (size_t)e * NT * hi, NT * hi, s);
+                const bf16* dh_e = ws.d_h1 + (size_t)e * NT * hi;
+                lt.generic_bwd_dw(dh_e, ws.norm2_out, ws.d_exp_w1[l] + (size_t)e * hi * C,
+                                  hi, C, NT, beta, s);
+                GemmDesc d2 = {NT, C, hi};
+                lt.gemm_nn(d2, dh_e, params.expert_w1[l] + (size_t)e * hi * C,
+                           ws.d_norm2, 1.0f, (e == 0) ? 0.0f : 1.0f, s);
+            }
         }
         // Router weight grad and its contribution to dn2
         lt.generic_bwd_dw(ws.d_rlogits, ws.norm2_out, ws.d_router_w[l], E, C, NT, beta, s);
@@ -565,6 +661,17 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
         launch_rmsnorm_bwd(xin, params.norm1_w[l], ws.d_norm1, ws.d_moe, ws.d_x, nullptr, NT, C, s);
 
         if (ustep == cfg.accum_steps - 1) {
+            // Apply the Q1.58 STE gate after all microbatch gradients are accumulated,
+            // before clipping so masked coordinates do not affect the global norm.
+            launch_ternary_abs_mean(params.qkv_fp32[l], quant_alpha, 3 * C * C, s);
+            launch_ternary_ste_mask(params.qkv_fp32[l], quant_alpha, ws.d_qkv_w[l], 3 * C * C, s);
+            launch_ternary_abs_mean(params.out_fp32[l], quant_alpha, C * C, s);
+            launch_ternary_ste_mask(params.out_fp32[l], quant_alpha, ws.d_out_w[l], C * C, s);
+            launch_ternary_abs_mean(params.exp_w1_fp32[l], quant_alpha, E * hi * C, s);
+            launch_ternary_ste_mask(params.exp_w1_fp32[l], quant_alpha, ws.d_exp_w1[l], E * hi * C, s);
+            launch_ternary_abs_mean(params.exp_w2_fp32[l], quant_alpha, E * C * hi, s);
+            launch_ternary_ste_mask(params.exp_w2_fp32[l], quant_alpha, ws.d_exp_w2[l], E * C * hi, s);
+
             launch_grad_norm_sq(ws.d_qkv_w[l],   ws.grad_norm_sq, 3 * C * C,  s);
             launch_grad_norm_sq(ws.d_out_w[l],   ws.grad_norm_sq, C * C,      s);
             launch_grad_norm_sq(ws.d_exp_w1[l],  ws.grad_norm_sq, E * hi * C, s);
@@ -590,9 +697,9 @@ void JarvisEngine::optimizer_step() {
     // prepare_optimizer_step atomically increments ws.adam_step on device,
     // then computes bias-correction factors and clip coefficient.
     launch_prepare_optimizer_step(
-        ws.adam_step, ws.d_bc1, ws.d_bc2, ws.d_clip_coef,
-        ws.grad_norm_sq,
-        cfg.beta1, cfg.beta2, cfg.grad_clip, s);
+        ws.adam_step, ws.d_bc1, ws.d_bc2, ws.d_clip_coef, ws.d_lr,
+        ws.grad_norm_sq, cfg.beta1, cfg.beta2, cfg.grad_clip, cfg.lr,
+        cfg.warmup_steps, cfg.decay_steps, cfg.min_lr_ratio, s);
 
     float lr = cfg.lr, b1 = cfg.beta1, b2 = cfg.beta2;
     float eps = cfg.eps, wd = cfg.weight_decay;
@@ -602,7 +709,7 @@ void JarvisEngine::optimizer_step() {
                        params.tok_emb_m, params.tok_emb_v,
                        ws.d_tok_emb,
                        lr, b1, b2, eps, wd,
-                       ws.d_bc1, ws.d_bc2, ws.d_clip_coef,
+                        ws.d_bc1, ws.d_bc2, ws.d_clip_coef, ws.d_lr,
                        cfg.vocab_padded * cfg.d_model, s);
 
     const int L = cfg.n_layers, C = cfg.d_model, E = cfg.n_experts, hi = cfg.expert_hidden;
@@ -612,38 +719,38 @@ void JarvisEngine::optimizer_step() {
                            params.qkv_m[l], params.qkv_v[l],
                            ws.d_qkv_w[l],
                            lr, b1, b2, eps, wd,
-                           ws.d_bc1, ws.d_bc2, ws.d_clip_coef, 3*C*C, s);
+                            ws.d_bc1, ws.d_bc2, ws.d_clip_coef, ws.d_lr, 3*C*C, s);
 
         launch_adamw_fused(params.out_fp32[l], params.out_w[l],
                            params.out_m[l], params.out_v[l],
                            ws.d_out_w[l],
                            lr, b1, b2, eps, wd,
-                           ws.d_bc1, ws.d_bc2, ws.d_clip_coef, C*C, s);
+                            ws.d_bc1, ws.d_bc2, ws.d_clip_coef, ws.d_lr, C*C, s);
 
         launch_adamw_fused(params.exp_w1_fp32[l], params.expert_w1[l],
                            params.exp_w1_m[l], params.exp_w1_v[l],
                            ws.d_exp_w1[l],
                            lr, b1, b2, eps, wd,
-                           ws.d_bc1, ws.d_bc2, ws.d_clip_coef, E*hi*C, s);
+                            ws.d_bc1, ws.d_bc2, ws.d_clip_coef, ws.d_lr, E*hi*C, s);
 
         launch_adamw_fused(params.exp_w2_fp32[l], params.expert_w2[l],
                            params.exp_w2_m[l], params.exp_w2_v[l],
                            ws.d_exp_w2[l],
                            lr, b1, b2, eps, wd,
-                           ws.d_bc1, ws.d_bc2, ws.d_clip_coef, E*C*hi, s);
+                            ws.d_bc1, ws.d_bc2, ws.d_clip_coef, ws.d_lr, E*C*hi, s);
 
         launch_adamw_fused(params.router_fp32[l], params.router_w[l],
                            params.router_m[l], params.router_v[l],
                            ws.d_router_w[l],
                            lr, b1, b2, eps, 0.0f,
-                           ws.d_bc1, ws.d_bc2, ws.d_clip_coef, C*E, s);
+                            ws.d_bc1, ws.d_bc2, ws.d_clip_coef, ws.d_lr, C*E, s);
     }
 
     launch_adamw_fused(params.final_norm_w_fp32, params.final_norm_w,
                        params.final_norm_m, params.final_norm_v,
                        ws.d_final_norm,
                        lr, b1, b2, eps, 0.0f,
-                       ws.d_bc1, ws.d_bc2, ws.d_clip_coef, C, s);
+                        ws.d_bc1, ws.d_bc2, ws.d_clip_coef, ws.d_lr, C, s);
 }
 
 // ===========================================================================
@@ -681,6 +788,11 @@ void JarvisEngine::warmup(int n_steps) {
 // JarvisEngine::capture_graph
 // ===========================================================================
 void JarvisEngine::capture_graph() {
+    if (sparse_moe_enabled()) {
+        graph_captured = false;
+        printf("[engine] Sparse top-2 MoE uses dynamic expert batches; CUDA Graph disabled.\n");
+        return;
+    }
     auto& rt = get_runtime();
     cudaStream_t s = rt.get_stream();
     float grad_scale = 1.0f / (float)cfg.accum_steps;
@@ -737,6 +849,14 @@ float JarvisEngine::train_step(const int* token_ids) {
     }
 
     rt.sync();
+    CUDA_CHECK(cudaMemcpy(&step_count, ws.adam_step, sizeof(step_count), cudaMemcpyDeviceToHost));
+
+    // The optimizer records an invalid clipping coefficient when its gradient
+    // norm is non-finite. Check it before returning a seemingly valid loss.
+    float clip_coef = 0.0f;
+    CUDA_CHECK(cudaMemcpy(&clip_coef, ws.d_clip_coef, sizeof(float), cudaMemcpyDeviceToHost));
+    if (!std::isfinite(clip_coef))
+        throw std::runtime_error("[optimizer] Non-finite gradient norm; skipped optimizer update.");
 
     float loss = 0.0f;
     CUDA_CHECK(cudaMemcpy(&loss, ws.loss, sizeof(float), cudaMemcpyDeviceToHost));
@@ -837,7 +957,9 @@ void JarvisEngine::profile_step(const int* token_ids, int n_reps,
 // ===========================================================================
 void JarvisEngine::save_checkpoint(const char* path) {
     get_runtime().sync();
-    std::ofstream f(path, std::ios::binary);
+    CUDA_CHECK(cudaMemcpy(&step_count, ws.adam_step, sizeof(step_count), cudaMemcpyDeviceToHost));
+    const std::string temp_path = std::string(path) + ".tmp";
+    std::ofstream f(temp_path, std::ios::binary | std::ios::trunc);
     if (!f) throw std::runtime_error("Cannot open checkpoint for writing");
 
     f.write(reinterpret_cast<const char*>(&step_count), sizeof(step_count));
@@ -847,8 +969,9 @@ void JarvisEngine::save_checkpoint(const char* path) {
 
     auto write_fp32 = [&](const float* dev, size_t n) {
         std::vector<float> h(n);
-        cudaMemcpy(h.data(), dev, n * sizeof(float), cudaMemcpyDeviceToHost);
+        CUDA_CHECK(cudaMemcpy(h.data(), dev, n * sizeof(float), cudaMemcpyDeviceToHost));
         f.write(reinterpret_cast<const char*>(h.data()), n * sizeof(float));
+        if (!f) throw std::runtime_error("Checkpoint write failed");
     };
 
     write_fp32(params.tok_emb_fp32, (size_t)Vp * C);
@@ -864,6 +987,26 @@ void JarvisEngine::save_checkpoint(const char* path) {
     }
     // router weights appended at the end (older checkpoints lack this section)
     for (int l = 0; l < L; ++l) write_fp32(params.router_fp32[l], (size_t)E*C);
+    write_fp32(params.tok_emb_m, (size_t)Vp*C); write_fp32(params.tok_emb_v, (size_t)Vp*C);
+    for (int l = 0; l < L; ++l) {
+        write_fp32(params.qkv_m[l], (size_t)3*C*C); write_fp32(params.qkv_v[l], (size_t)3*C*C);
+        write_fp32(params.out_m[l], (size_t)C*C); write_fp32(params.out_v[l], (size_t)C*C);
+        write_fp32(params.exp_w1_m[l], (size_t)E*hi*C); write_fp32(params.exp_w1_v[l], (size_t)E*hi*C);
+        write_fp32(params.exp_w2_m[l], (size_t)E*C*hi); write_fp32(params.exp_w2_v[l], (size_t)E*C*hi);
+        write_fp32(params.router_m[l], (size_t)E*C); write_fp32(params.router_v[l], (size_t)E*C);
+    }
+    write_fp32(params.final_norm_m, C); write_fp32(params.final_norm_v, C);
+    f.flush();
+    if (!f) throw std::runtime_error("Checkpoint flush failed");
+    f.close();
+    if (!f) throw std::runtime_error("Checkpoint close failed");
+#ifdef _WIN32
+    if (!MoveFileExA(temp_path.c_str(), path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        throw std::runtime_error("Checkpoint atomic replace failed");
+#else
+    if (std::rename(temp_path.c_str(), path) != 0)
+        throw std::runtime_error("Checkpoint atomic replace failed");
+#endif
     printf("[checkpoint] Saved '%s' step=%d\n", path, step_count);
 }
 
@@ -872,14 +1015,35 @@ void JarvisEngine::load_checkpoint(const char* path) {
     if (!f) throw std::runtime_error("Cannot open checkpoint for reading");
 
     f.read(reinterpret_cast<char*>(&step_count), sizeof(step_count));
+    if (!f || step_count < 0) throw std::runtime_error("Invalid checkpoint header");
 
     const int L = cfg.n_layers, C = cfg.d_model, E = cfg.n_experts, hi = cfg.expert_hidden;
     const int Vp = cfg.vocab_padded, H = cfg.n_heads;
 
+    const size_t core_floats = (size_t)Vp*C + C + (size_t)L *
+        (3ULL*C*C + (size_t)C*C + (size_t)E*hi*C + (size_t)E*C*hi + 2ULL*C + H);
+    const size_t core_bytes = sizeof(int) + core_floats * sizeof(float);
+    const size_t router_floats = (size_t)L*E*C;
+    const size_t routed_bytes = core_bytes + router_floats*sizeof(float);
+    const size_t adam_floats = (size_t)Vp*C + C + (size_t)L *
+        (3ULL*C*C + (size_t)C*C + (size_t)E*hi*C + (size_t)E*C*hi + (size_t)E*C);
+    const size_t full_bytes = routed_bytes + 2*adam_floats*sizeof(float);
+    const size_t full_bytes_legacy = full_bytes + router_floats*sizeof(float);
+    f.seekg(0, std::ios::end);
+    const std::streamoff file_bytes = f.tellg();
+    const bool has_adam = file_bytes == (std::streamoff)full_bytes ||
+                          file_bytes == (std::streamoff)full_bytes_legacy ||
+                          file_bytes == (std::streamoff)(full_bytes + sizeof(float)) ||
+                          file_bytes == (std::streamoff)(full_bytes_legacy + sizeof(float));
+    if (file_bytes != (std::streamoff)core_bytes && file_bytes != (std::streamoff)routed_bytes && !has_adam)
+        throw std::runtime_error("Checkpoint size does not match this model");
+    f.seekg(0, std::ios::beg);
+
     auto read_fp32 = [&](float* dev, size_t n) {
         std::vector<float> h(n);
         f.read(reinterpret_cast<char*>(h.data()), n * sizeof(float));
-        cudaMemcpy(dev, h.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+        if (!f) throw std::runtime_error("Truncated checkpoint");
+        CUDA_CHECK(cudaMemcpy(dev, h.data(), n * sizeof(float), cudaMemcpyHostToDevice));
     };
 
     read_fp32(params.tok_emb_fp32, (size_t)Vp * C);
@@ -899,8 +1063,20 @@ void JarvisEngine::load_checkpoint(const char* path) {
         std::vector<float> h((size_t)E*C);
         f.read(reinterpret_cast<char*>(h.data()), h.size() * sizeof(float));
         if (!f) { has_router = false; break; }
-        cudaMemcpy(params.router_fp32[l], h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(params.router_fp32[l], h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice));
     }
+    if (has_adam) {
+        read_fp32(params.tok_emb_m, (size_t)Vp*C); read_fp32(params.tok_emb_v, (size_t)Vp*C);
+        for (int l = 0; l < L; ++l) {
+            read_fp32(params.qkv_m[l], (size_t)3*C*C); read_fp32(params.qkv_v[l], (size_t)3*C*C);
+            read_fp32(params.out_m[l], (size_t)C*C); read_fp32(params.out_v[l], (size_t)C*C);
+            read_fp32(params.exp_w1_m[l], (size_t)E*hi*C); read_fp32(params.exp_w1_v[l], (size_t)E*hi*C);
+            read_fp32(params.exp_w2_m[l], (size_t)E*C*hi); read_fp32(params.exp_w2_v[l], (size_t)E*C*hi);
+            read_fp32(params.router_m[l], (size_t)E*C); read_fp32(params.router_v[l], (size_t)E*C);
+        }
+        read_fp32(params.final_norm_m, C); read_fp32(params.final_norm_v, C);
+    }
+    CUDA_CHECK(cudaMemcpy(ws.adam_step, &step_count, sizeof(step_count), cudaMemcpyHostToDevice));
     get_runtime().sync();
     // Re-quantize after loading, then refresh BF16 copies of non-ternary params
     quantize_all_weights();

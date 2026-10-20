@@ -5,6 +5,8 @@
 *.pth
 *.bin
 *.ckpt
+*.ckpt.tmp
+*.ckpt.meta.json*
 *.safetensors
 *.jarvis-tbin
 checkpoint*
@@ -73,3 +75,4 @@ ENV/
 *~
 .DS_Store
 Thumbs.db
+\ndata/train_tokens_300m_en25_code75.npy\ndata/train_tokens_300m_en25_code75.meta\ndata/train_tokens.meta\n

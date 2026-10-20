@@ -31,7 +31,7 @@ if _TRITON_STE_AVAILABLE:
 
     @triton.jit
     def _ternary_quantize_bwd_kernel(
-        GradOut_ptr, W_ptr, GradW_ptr,
+        GradOut_ptr, W_ptr, Alpha_ptr, GradW_ptr,
         N_elements, BLOCK_SIZE: tl.constexpr
     ):
         pid = tl.program_id(0)
@@ -40,10 +40,11 @@ if _TRITON_STE_AVAILABLE:
         
         go = tl.load(GradOut_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         w = tl.load(W_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        is_valid = tl.abs(w) <= 1.0
+        alpha = tl.load(Alpha_ptr).to(tl.float32)
+        is_valid = tl.abs(w) <= alpha
         gw = tl.where(is_valid, go, 0.0)
         
-        tl.store(GradW_ptr + offsets, gw.to(tl.bfloat16), mask=mask)
+        tl.store(GradW_ptr + offsets, gw.to(GradW_ptr.dtype.element_ty), mask=mask)
 
     class FusedTernaryQuantizeSTE(torch.autograd.Function):
         @staticmethod
@@ -52,7 +53,7 @@ if _TRITON_STE_AVAILABLE:
                 alpha = w.abs().mean().clamp(min=1e-8)
                 w_norm = w / alpha
                 w_q = torch.round(torch.clamp(w_norm, -1.0, 1.0))
-                ctx.save_for_backward(w)
+                ctx.save_for_backward(w, alpha)
                 return w_q * alpha
 
             alpha = w.abs().mean().clamp(min=1e-8)
@@ -65,14 +66,14 @@ if _TRITON_STE_AVAILABLE:
                 N, BLOCK_SIZE=BLOCK_SIZE,
                 num_warps=4
             )
-            ctx.save_for_backward(w)
+            ctx.save_for_backward(w, alpha)
             return wq
 
         @staticmethod
         def backward(ctx, grad_output):
-            w, = ctx.saved_tensors
+            w, alpha = ctx.saved_tensors
             if not w.is_cuda:
-                mask = (w.abs() <= 1.0).to(dtype=grad_output.dtype)
+                mask = (w.abs() <= alpha).to(dtype=grad_output.dtype)
                 return grad_output * mask
 
             grad_w = torch.empty_like(w)
@@ -80,7 +81,7 @@ if _TRITON_STE_AVAILABLE:
             BLOCK_SIZE = 1024
             grid = (triton.cdiv(N, BLOCK_SIZE),)
             _ternary_quantize_bwd_kernel[grid](
-                grad_output, w, grad_w,
+                grad_output, w, alpha, grad_w,
                 N, BLOCK_SIZE=BLOCK_SIZE,
                 num_warps=4
             )
@@ -107,13 +108,13 @@ else:
             alpha = w.abs().mean().clamp(min=1e-8)      # AbsMean scale (BitNet convention)
             w_norm = w / alpha                           # normalise to ≈ unit scale
             w_q = torch.round(torch.clamp(w_norm, -1.0, 1.0))
-            ctx.save_for_backward(w)                     # save ORIGINAL W_FP32 for Eq. 5 mask
+            ctx.save_for_backward(w, alpha)              # save master weights and AbsMean threshold
             return w_q * alpha                           # rescale back to original magnitude
 
         @staticmethod
         def backward(ctx, grad_output):
-            w, = ctx.saved_tensors
-            mask = (w.abs() <= 1.0).float()
+            w, alpha = ctx.saved_tensors
+            mask = (w.abs() <= alpha).to(dtype=grad_output.dtype)
             return grad_output * mask
 
 
@@ -127,7 +128,7 @@ class TernaryLinear(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
 
     def forward(self, x):
-        w_q = TernaryQuantizeSTE.apply(self.weight)
+        w_q = self.weight if getattr(self, "_native_prequantized", False) else TernaryQuantizeSTE.apply(self.weight)
         return F.linear(x, w_q, self.bias)
 
 
@@ -135,18 +136,15 @@ class FusedQKVSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, weight):
         # weight: (3 * d_model, d_model) -> 3 projections: Q, K, V
-        ctx.save_for_backward(weight)
-        d_model = weight.shape[1]
-        w_split = weight.view(3, d_model, d_model)
-        alpha = w_split.abs().mean(dim=(1, 2), keepdim=True).clamp(min=1e-5)
-        w_norm = (w_split / alpha).clamp(-1.0, 1.0).round()
-        w_q = (w_norm * alpha).view(3 * d_model, d_model)
-        return w_q
+        alpha = weight.abs().mean().clamp(min=1e-8)
+        ctx.save_for_backward(weight, alpha)
+        w_norm = (weight / alpha).clamp(-1.0, 1.0).round()
+        return w_norm * alpha
 
     @staticmethod
     def backward(ctx, grad_w_q):
-        weight, = ctx.saved_tensors
-        mask = (weight.abs() <= 1.0).to(grad_w_q.dtype)
+        weight, alpha = ctx.saved_tensors
+        mask = (weight.abs() <= alpha).to(grad_w_q.dtype)
         return grad_w_q * mask
 
 
@@ -158,7 +156,7 @@ class FusedQKVLinear(nn.Module):
         nn.init.normal_(self.weight, std=0.02)
 
     def forward(self, x):
-        w_q = FusedQKVSTE.apply(self.weight)
+        w_q = self.weight if getattr(self, "_native_prequantized", False) else FusedQKVSTE.apply(self.weight)
         return F.linear(x, w_q)
 
 
