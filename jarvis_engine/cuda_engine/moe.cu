@@ -35,20 +35,22 @@ __global__ void top2_gating_kernel(
     int*                 __restrict__ topk_idx,  // [NT, 2]
     float*               __restrict__ topk_gates,// [NT, 2]
     int*                 __restrict__ expert_counts,
+    const float*         __restrict__ expert_biases, // [4] or nullptr (DeepSeek-V3 aux-free)
     int NT, float noise_std, const int* step, int noise_seed
 ) {
     int tok = blockIdx.x * blockDim.x + threadIdx.x;
     if (tok >= NT) return;
 
     int base = tok * 4;
-    float raw[4];   // raw logits
-    float noised[4]; // logits + Gumbel noise (used for hard selection)
+    float raw[4];    // raw logits
+    float noised[4]; // logits + bias + Gumbel noise (used for hard selection)
 
     // ---- Load logits + compute Gumbel noise --------------------------------
     unsigned step_seed = step ? (unsigned)(*step) : 0u;
     #pragma unroll
     for (int e = 0; e < 4; ++e) {
         raw[e] = __bfloat162float(logits[base + e]);
+        float bias_e = expert_biases ? expert_biases[e] : 0.0f;
         if (noise_std > 0.0f) {
             // Stateless Gumbel noise: -log(-log(u)), u ~ Uniform(0,1)
             // Uses the same hash chain as before for CUDA-graph determinism.
@@ -57,13 +59,11 @@ __global__ void top2_gating_kernel(
                          (unsigned)(noise_seed * 0xc2b2ae35u) ^
                          (step_seed * 0x27d4eb2fu);
             h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15;
-            unsigned h2 = h * 0x846ca68bu + 0xda3e39cbu;
-            // Two independent uniform samples for Gumbel (only u1 needed, u2 spare)
             float u1 = ((h  & 0x00ffffffu) + 1.0f) * (1.0f / 16777217.0f);
             float g  = -logf(-logf(u1));  // Gumbel(0,1)
-            noised[e] = raw[e] + noise_std * g;
+            noised[e] = raw[e] + bias_e + noise_std * g;
         } else {
-            noised[e] = raw[e];
+            noised[e] = raw[e] + bias_e;
         }
     }
 
@@ -91,6 +91,7 @@ __global__ void top2_gating_kernel(
     // Forward: hard gate weights from softmax restricted to {i0, i1}.
     // Backward (STE): gradient flows only through i0 and i1 paths — the
     // selection mask itself carries no gradient (straight-through).
+    // Note: Gate weights use raw logits (without bias), strictly following DeepSeek-V3.
     float mx2  = fmaxf(raw[i0], raw[i1]);
     float e0   = expf(raw[i0] - mx2);
     float e1   = expf(raw[i1] - mx2);
@@ -109,22 +110,49 @@ __global__ void top2_gating_kernel(
 void launch_top2_gating(
     const __nv_bfloat16* logits, float* probs,
     int* topk_idx, float* topk_gates,
-    int NT, int E, float noise_std, const int* step, int noise_seed, cudaStream_t s
+    int NT, int E, float noise_std, const int* step, int noise_seed,
+    const float* expert_biases, cudaStream_t s
 ) {
     (void)E;  // locked to 4
     top2_gating_kernel<<<(NT + 255) / 256, 256, 0, s>>>(
-        logits, probs, topk_idx, topk_gates, nullptr, NT, noise_std, step, noise_seed);
+        logits, probs, topk_idx, topk_gates, nullptr, expert_biases, NT, noise_std, step, noise_seed);
     CUDA_CHECK_LAST();
 }
 
 void launch_top2_gating_count(
     const __nv_bfloat16* logits, float* probs,
     int* topk_idx, float* topk_gates, int* expert_counts,
-    int NT, int E, float noise_std, const int* step, int noise_seed, cudaStream_t s
+    int NT, int E, float noise_std, const int* step, int noise_seed,
+    const float* expert_biases, cudaStream_t s
 ) {
     (void)E;  // locked to 4
     top2_gating_kernel<<<(NT + 255) / 256, 256, 0, s>>>(
-        logits, probs, topk_idx, topk_gates, expert_counts, NT, noise_std, step, noise_seed);
+        logits, probs, topk_idx, topk_gates, expert_counts, expert_biases, NT, noise_std, step, noise_seed);
+    CUDA_CHECK_LAST();
+}
+
+// Dynamic router bias update (DeepSeek-V3 Auxiliary-Loss-Free load balancing)
+__global__ void update_expert_biases_kernel(
+    float*       __restrict__ expert_biases, // [E]
+    const int*   __restrict__ expert_counts, // [E]
+    int NT, int K, int E, float gamma
+) {
+    int e = threadIdx.x;
+    if (e >= E) return;
+    float total_routes = (float)(NT * K);
+    float f_e = (float)expert_counts[e] / (total_routes + 1e-8f);
+    float target = 1.0f / (float)E;
+    // DeepSeek-V3 controller update: reduce bias if overloaded, increase if underloaded
+    expert_biases[e] -= gamma * (f_e - target);
+}
+
+void launch_update_expert_biases(
+    float* expert_biases, const int* expert_counts,
+    int NT, int K, int E, float gamma, cudaStream_t s
+) {
+    if (!expert_biases || !expert_counts) return;
+    update_expert_biases_kernel<<<1, E, 0, s>>>(
+        expert_biases, expert_counts, NT, K, E, gamma);
     CUDA_CHECK_LAST();
 }
 
@@ -462,6 +490,110 @@ void launch_gelu_bwd(
 ) {
     // SCALAR — 1 element per thread, no vectorization
     gelu_bwd_kernel<<<(N + 255) / 256, 256, 0, s>>>(x_pre, grad_out, grad_x, N);
+    CUDA_CHECK_LAST();
+}
+
+// ===========================================================================
+// 4b. SQUARED RELU (ReLU² = max(0, x)²) — BitNet 2B4T / Primer Architecture
+//     Advantages for Ternary 1.58-bit on SM120 (Blackwell RTX 5070):
+//       1. Zero transcendental SFU ops: GELU uses tanhf, which serializes
+//          threads on the SM SFU. ReLU² uses only fmaxf and multiply.
+//       2. Full vec8 (uint4) vectorization in both forward and backward!
+//       3. High activation sparsity (~70-90% exact zeros), perfectly
+//          complementing {-1, 0, +1} ternary weights.
+// ===========================================================================
+__global__ void relu2_fwd_vec8_kernel(__nv_bfloat16* x, int N8) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N8) return;
+
+    uint4 v = *reinterpret_cast<uint4*>(x + i * 8);
+    __nv_bfloat16* e = reinterpret_cast<__nv_bfloat16*>(&v);
+
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        float vf = __bfloat162float(e[j]);
+        float pos = fmaxf(0.0f, vf);
+        e[j] = __float2bfloat16(pos * pos);
+    }
+    *reinterpret_cast<uint4*>(x + i * 8) = v;
+}
+
+void launch_relu2_fwd_inplace(__nv_bfloat16* x, int N, cudaStream_t s) {
+    int N8 = N / 8, BLOCK = 256;
+    relu2_fwd_vec8_kernel<<<(N8 + BLOCK - 1) / BLOCK, BLOCK, 0, s>>>(x, N8);
+    CUDA_CHECK_LAST();
+}
+
+__global__ void relu2_fwd_stash_vec8_kernel(
+    const __nv_bfloat16* __restrict__ h1_in,
+    __nv_bfloat16*       __restrict__ stash,
+    __nv_bfloat16*       __restrict__ h1_out,
+    int N8
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N8) return;
+
+    uint4 v = *reinterpret_cast<const uint4*>(h1_in + i * 8);
+    // Write pre-activation checkpoint stash
+    *reinterpret_cast<uint4*>(stash + i * 8) = v;
+
+    __nv_bfloat16* e = reinterpret_cast<__nv_bfloat16*>(&v);
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        float vf = __bfloat162float(e[j]);
+        float pos = fmaxf(0.0f, vf);
+        e[j] = __float2bfloat16(pos * pos);
+    }
+    *reinterpret_cast<uint4*>(h1_out + i * 8) = v;
+}
+
+void launch_relu2_fwd_stash(
+    const __nv_bfloat16* h1_in,
+    __nv_bfloat16*       stash,
+    __nv_bfloat16*       h1_out,
+    int N, cudaStream_t s
+) {
+    int N8 = N / 8, BLOCK = 256;
+    relu2_fwd_stash_vec8_kernel<<<(N8 + BLOCK - 1) / BLOCK, BLOCK, 0, s>>>(
+        h1_in, stash, h1_out, N8);
+    CUDA_CHECK_LAST();
+}
+
+__global__ void relu2_bwd_vec8_kernel(
+    const __nv_bfloat16* __restrict__ x_pre,
+    const __nv_bfloat16* __restrict__ grad_out,
+    __nv_bfloat16*       __restrict__ grad_x,
+    int N8
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N8) return;
+
+    uint4 xp_u = *reinterpret_cast<const uint4*>(x_pre + i * 8);
+    uint4 go_u = *reinterpret_cast<const uint4*>(grad_out + i * 8);
+    const __nv_bfloat16* xp = reinterpret_cast<const __nv_bfloat16*>(&xp_u);
+    const __nv_bfloat16* go = reinterpret_cast<const __nv_bfloat16*>(&go_u);
+
+    uint4 gx_u;
+    __nv_bfloat16* gx = reinterpret_cast<__nv_bfloat16*>(&gx_u);
+
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        float x_val = __bfloat162float(xp[j]);
+        float g_val = __bfloat162float(go[j]);
+        // d/dx [max(0, x)^2] = 2 * x if x > 0 else 0
+        float dact = (x_val > 0.0f) ? (2.0f * x_val * g_val) : 0.0f;
+        gx[j] = __float2bfloat16(dact);
+    }
+    *reinterpret_cast<uint4*>(grad_x + i * 8) = gx_u;
+}
+
+void launch_relu2_bwd(
+    const __nv_bfloat16* x_pre, const __nv_bfloat16* grad_out,
+    __nv_bfloat16* grad_x, int N, cudaStream_t s
+) {
+    int N8 = N / 8, BLOCK = 256;
+    relu2_bwd_vec8_kernel<<<(N8 + BLOCK - 1) / BLOCK, BLOCK, 0, s>>>(
+        x_pre, grad_out, grad_x, N8);
     CUDA_CHECK_LAST();
 }
 

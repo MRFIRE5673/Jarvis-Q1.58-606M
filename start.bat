@@ -114,22 +114,18 @@ goto back
 :train_resume
 if not exist "data\jarvis_cuda.ckpt" (
     echo No existing checkpoint found at data\jarvis_cuda.ckpt.
-    echo Please run a fresh training run first (option 5).
+    echo Please run a fresh training run first.
     goto back
 )
-choice /c RL /n /m "Resume on dataset cursor (R) or resume at LR 2e-5 (L)? "
-if errorlevel 2 goto resume_lr
+set "JARVIS_TRAIN_DATA=data\train_tokens_300m_en25_code75.npy"
+set "JARVIS_TRAIN_TOKENS=400000000"
+echo Resuming 300M corpus training from checkpoint...
 python jarvis_engine\train_cuda.py resume-data
-goto back
-
-:resume_lr
-set "JARVIS_LR=2e-5"
-python jarvis_engine\train_cuda.py resume-lr
 goto back
 
 :train_instruction
 if not exist "data\jarvis_cuda.ckpt" (
-    echo Instruction tuning requires an existing native CUDA checkpoint (data\jarvis_cuda.ckpt).
+    echo Instruction tuning requires an existing native CUDA checkpoint.
     goto back
 )
 set "SAVED_JARVIS_TRAIN_DATA=%JARVIS_TRAIN_DATA%"

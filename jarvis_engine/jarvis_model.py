@@ -362,16 +362,21 @@ class _STETopK(torch.autograd.Function):
 # ---------------------------------------------------------------------------
 class SparseMoELayer(nn.Module):
     def __init__(self, d_model, num_experts=4, top_k=2, hidden_mult=2,
-                 noise_std=0.1, balance_alpha=0.01):
+                 noise_std=0.1, balance_alpha=0.01, use_aux_free=True,
+                 bias_gamma=0.005, activation="gelu"):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.balance_alpha = balance_alpha
+        self.use_aux_free = use_aux_free
+        self.bias_gamma = bias_gamma
+        self.activation = activation.lower()
         # Learned expert centroid embeddings (friend's design: dot-product routing)
         # Replaces nn.Linear router — no bias, init matches friend's ±0.1 uniform
         self.expert_emb = nn.Parameter(
             torch.empty(num_experts, d_model).uniform_(-0.1, 0.1)
         )
+        self.register_buffer("expert_bias", torch.zeros(num_experts))
         hidden = d_model * hidden_mult
         self.w1 = nn.ModuleList([TernaryLinear(d_model, hidden) for _ in range(num_experts)])
         self.w2 = nn.ModuleList([TernaryLinear(hidden, d_model) for _ in range(num_experts)])
@@ -381,24 +386,34 @@ class SparseMoELayer(nn.Module):
         u = torch.rand(shape, device=device).clamp(min=1e-10)
         return -torch.log(-torch.log(u))
 
+    def _act(self, x: torch.Tensor) -> torch.Tensor:
+        if self.activation in ("relu2", "squared_relu"):
+            return F.relu(x).square()
+        return F.gelu(x)
+
     def forward(self, x: torch.Tensor):
         B, T, C = x.shape
         N = B * T
         x_flat = x.view(N, C)
 
-        # Router scores: dot product between token and expert embeddings (N, E)
-        scores = x_flat @ self.expert_emb.t()
+        # Router raw scores: dot product between token and expert embeddings (N, E)
+        raw_scores = x_flat @ self.expert_emb.t()
+
+        if self.use_aux_free:
+            selection_scores = raw_scores + self.expert_bias
+        else:
+            selection_scores = raw_scores
 
         # Gumbel noise during training — breaks symmetry without biasing probs
         if self.training:
-            scores = scores + self._gumbel(scores.shape, scores.device)
+            selection_scores = selection_scores + self._gumbel(raw_scores.shape, raw_scores.device)
 
-        # Soft probs for load-balance loss (need full distribution)
-        probs = F.softmax(scores, dim=-1)   # (N, E)
+        # Soft probs for monitoring / aux loss
+        probs = F.softmax(raw_scores, dim=-1)   # (N, E)
 
         # Hard top-K mask with straight-through gradient
-        mask = _STETopK.apply(scores, self.top_k)              # (N, E) hard
-        masked_scores = scores.masked_fill(mask == 0, float("-inf"))
+        mask = _STETopK.apply(selection_scores, self.top_k)              # (N, E) hard
+        masked_scores = raw_scores.masked_fill(mask == 0, float("-inf"))
         topk_gates_full = F.softmax(masked_scores, dim=-1) * mask  # (N, E) sparse
         topk_gates_full = topk_gates_full / (topk_gates_full.sum(-1, keepdim=True) + 1e-9)
 
@@ -414,15 +429,23 @@ class SparseMoELayer(nn.Module):
             m = flat_idx == e
             if m.any():
                 xe = flat_x[m]
-                flat_out[m] = flat_gate[m].unsqueeze(-1) * self.w2[e](F.gelu(self.w1[e](xe)))
+                flat_out[m] = flat_gate[m].unsqueeze(-1) * self.w2[e](self._act(self.w1[e](xe)))
 
         out = flat_out.view(N, self.top_k, C).sum(dim=1).view(B, T, C)
 
-        # Load-balance loss: α * E * Σ f_i * P_i  (Eq. 6)
-        # f_i = mean dispatch fraction, P_i = mean gate probability
-        f = mask.mean(dim=0)   # (E,) — mean fraction dispatched per expert
-        P = probs.mean(dim=0)  # (E,) — mean gate probability per expert
-        l_balance = self.balance_alpha * self.num_experts * (f * P).sum()
+        if self.use_aux_free:
+            # DeepSeek-V3 dynamic closed-loop bias update (outside autograd)
+            if self.training:
+                with torch.no_grad():
+                    f = mask.mean(dim=0)
+                    target = 1.0 / self.num_experts
+                    self.expert_bias.add_(-self.bias_gamma * (f - target))
+            l_balance = torch.zeros((), device=x.device, dtype=x.dtype)
+        else:
+            # Traditional load-balance loss: α * E * Σ f_i * P_i  (Eq. 6)
+            f = mask.mean(dim=0)   # (E,) — mean fraction dispatched per expert
+            P = probs.mean(dim=0)  # (E,) — mean gate probability per expert
+            l_balance = self.balance_alpha * self.num_experts * (f * P).sum()
 
         act_mean = out.mean()
         act_var  = out.var()

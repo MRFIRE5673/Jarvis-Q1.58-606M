@@ -34,18 +34,23 @@ class _STETopK(torch.autograd.Function):
 
 class SparseTopKRouter(nn.Module):
     """
-    Dot-product learned centroid router with Gumbel noise and STE top-K selection.
+    Dot-product learned centroid router with Gumbel noise, STE top-K selection,
+    and optional DeepSeek-V3 Auxiliary-Loss-Free load balancing via dynamic bias.
     """
     def __init__(self, d_model: int, num_experts: int = 4, top_k: int = 2,
-                 balance_alpha: float = 0.01):
+                 balance_alpha: float = 0.01, use_aux_free: bool = True,
+                 bias_gamma: float = 0.005):
         super().__init__()
         self.d_model = d_model
         self.num_experts = num_experts
         self.top_k = top_k
         self.balance_alpha = balance_alpha
+        self.use_aux_free = use_aux_free
+        self.bias_gamma = bias_gamma
         self.expert_emb = nn.Parameter(
             torch.empty(num_experts, d_model).uniform_(-0.1, 0.1)
         )
+        self.register_buffer("expert_bias", torch.zeros(num_experts))
 
     @staticmethod
     def _gumbel(shape: torch.Size, device: torch.device) -> torch.Tensor:
@@ -62,24 +67,39 @@ class SparseTopKRouter(nn.Module):
             l_balance:  scalar load balancing loss
         """
         N = x.size(0)
-        scores = x @ self.expert_emb.t()  # [N, E]
+        raw_scores = x @ self.expert_emb.t()  # [N, E]
+
+        if self.use_aux_free:
+            selection_scores = raw_scores + self.expert_bias
+        else:
+            selection_scores = raw_scores
 
         if self.training:
-            scores = scores + self._gumbel(scores.shape, scores.device)
+            selection_scores = selection_scores + self._gumbel(raw_scores.shape, raw_scores.device)
 
-        probs = F.softmax(scores, dim=-1)  # [N, E]
+        probs = F.softmax(raw_scores, dim=-1)  # [N, E]
 
-        mask = _STETopK.apply(scores, self.top_k)  # [N, E] hard
-        masked_scores = scores.masked_fill(mask == 0, float("-inf"))
+        # Top-K selection on selection_scores (with STE)
+        mask = _STETopK.apply(selection_scores, self.top_k)  # [N, E] hard
+        masked_scores = raw_scores.masked_fill(mask == 0, float("-inf"))
         topk_gates_full = F.softmax(masked_scores, dim=-1) * mask  # [N, E]
         topk_gates_full = topk_gates_full / (topk_gates_full.sum(-1, keepdim=True) + 1e-9)
 
         topk_gates, topk_idx = topk_gates_full.topk(self.top_k, dim=-1)  # [N, K]
 
-        # Load-balance loss: alpha * E * sum(f_i * P_i) (Paper Eq. 6)
-        f = mask.mean(dim=0)
-        P = probs.mean(dim=0)
-        l_balance = self.balance_alpha * self.num_experts * (f * P).sum()
+        if self.use_aux_free:
+            # DeepSeek-V3 dynamic closed-loop bias update (outside autograd)
+            if self.training:
+                with torch.no_grad():
+                    f = mask.mean(dim=0)
+                    target = 1.0 / self.num_experts
+                    self.expert_bias.add_(-self.bias_gamma * (f - target))
+            l_balance = torch.zeros((), device=x.device, dtype=x.dtype)
+        else:
+            # Traditional auxiliary load-balance loss: alpha * E * sum(f_i * P_i)
+            f = mask.mean(dim=0)
+            P = probs.mean(dim=0)
+            l_balance = self.balance_alpha * self.num_experts * (f * P).sum()
 
         return topk_gates, topk_idx, l_balance
 
@@ -87,17 +107,25 @@ class SparseTopKRouter(nn.Module):
 class TernaryMoE(nn.Module):
     """
     Complete Ternary MoE layer using SparseTopKRouter and TernaryLinear experts.
+    Supports GELU and Squared ReLU (ReLU² = max(0, x)²).
     """
     def __init__(self, d_model: int, num_experts: int = 4, top_k: int = 2,
-                 hidden_mult: int = 2, balance_alpha: float = 0.01):
+                 hidden_mult: int = 2, balance_alpha: float = 0.01,
+                 use_aux_free: bool = True, activation: str = "gelu"):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
+        self.activation = activation.lower()
         self.router = SparseTopKRouter(d_model, num_experts=num_experts, top_k=top_k,
-                                       balance_alpha=balance_alpha)
+                                       balance_alpha=balance_alpha, use_aux_free=use_aux_free)
         hidden = d_model * hidden_mult
         self.w1 = nn.ModuleList([TernaryLinear(d_model, hidden) for _ in range(num_experts)])
         self.w2 = nn.ModuleList([TernaryLinear(hidden, d_model) for _ in range(num_experts)])
+
+    def _act(self, x: torch.Tensor) -> torch.Tensor:
+        if self.activation in ("relu2", "squared_relu"):
+            return F.relu(x).square()
+        return F.gelu(x)
 
     def forward(self, x: torch.Tensor):
         B, T, C = x.shape
@@ -115,7 +143,7 @@ class TernaryMoE(nn.Module):
             m = flat_idx == e
             if m.any():
                 xe = flat_x[m]
-                flat_out[m] = flat_gate[m].unsqueeze(-1) * self.w2[e](F.gelu(self.w1[e](xe)))
+                flat_out[m] = flat_gate[m].unsqueeze(-1) * self.w2[e](self._act(self.w1[e](xe)))
 
         out = flat_out.view(N, self.top_k, C).sum(dim=1).view(B, T, C)
         return out, l_balance

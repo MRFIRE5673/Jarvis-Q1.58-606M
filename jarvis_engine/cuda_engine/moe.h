@@ -22,13 +22,21 @@
 void launch_top2_gating(
     const __nv_bfloat16* logits, float* probs,
     int* topk_idx, float* topk_gates,
-    int NT, int E, float noise_std, const int* step, int noise_seed, cudaStream_t s
+    int NT, int E, float noise_std, const int* step, int noise_seed,
+    const float* expert_biases, cudaStream_t s
 );
 
 void launch_top2_gating_count(
     const __nv_bfloat16* logits, float* probs,
     int* topk_idx, float* topk_gates, int* expert_counts,
-    int NT, int E, float noise_std, const int* step, int noise_seed, cudaStream_t s
+    int NT, int E, float noise_std, const int* step, int noise_seed,
+    const float* expert_biases, cudaStream_t s
+);
+
+// Dynamic router bias update (DeepSeek-V3 Auxiliary-Loss-Free load balancing)
+void launch_update_expert_biases(
+    float* expert_biases, const int* expert_counts,
+    int NT, int K, int E, float gamma, cudaStream_t s
 );
 
 void launch_expert_offsets(const int* counts, int* offsets, int E, cudaStream_t s);
@@ -89,6 +97,26 @@ void launch_gelu_fwd_stash(
 // GELU backward: x_pre[NTK,hi], grad_out[NTK,hi] → grad_x[NTK,hi]
 // SCALAR — do not vectorize (transcendental ILP constraint)
 void launch_gelu_bwd(
+    const __nv_bfloat16* x_pre, const __nv_bfloat16* grad_out,
+    __nv_bfloat16* grad_x, int N, cudaStream_t s
+);
+
+// Squared ReLU (ReLU² = max(0, x)²) — BitNet 2B4T / Primer
+// Forward: vec8 (no transcendental functions), ~70-90% natural activation sparsity
+void launch_relu2_fwd_inplace(
+    __nv_bfloat16* x, int N, cudaStream_t s
+);
+
+void launch_relu2_fwd_stash(
+    const __nv_bfloat16* h1_in,
+    __nv_bfloat16*       stash,
+    __nv_bfloat16*       h1_out,
+    int N, cudaStream_t s
+);
+
+// Squared ReLU backward: grad_x = (x > 0) ? (2 * x * grad_out) : 0
+// Full vec8 vectorized — zero transcendental instructions, max memory bandwidth
+void launch_relu2_bwd(
     const __nv_bfloat16* x_pre, const __nv_bfloat16* grad_out,
     __nv_bfloat16* grad_x, int N, cudaStream_t s
 );

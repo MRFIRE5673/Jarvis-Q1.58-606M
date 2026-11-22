@@ -196,6 +196,7 @@ struct JarvisWorkspace {
     int*   expert_counts = nullptr; // [E] active rows per expert
     int*   expert_offsets = nullptr; // [E+1] compact expert segment offsets
     int*   route_write  = nullptr;  // [E] temporary compact dispatch cursors
+    float* expert_biases = nullptr; // [L, E] per-layer router biases (DeepSeek-V3 aux-loss-free balancing)
     float* route_probs_cache = nullptr; // [L,NT,E]
     int*   topk_idx_cache = nullptr;    // [L,NT,K]
     float* topk_gates_cache = nullptr;  // [L,NT,K]

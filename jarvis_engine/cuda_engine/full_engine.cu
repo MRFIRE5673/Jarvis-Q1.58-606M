@@ -65,6 +65,11 @@ extern void launch_sparse_combine_bwd(const bf16*, const bf16*, const int*, cons
 extern void launch_gelu_fwd_inplace(bf16*, int, cudaStream_t);
 extern void launch_gelu_fwd_stash(const bf16*, bf16*, bf16*, int, cudaStream_t);
 extern void launch_gelu_bwd(const bf16*, const bf16*, bf16*, int, cudaStream_t);
+extern void launch_relu2_fwd_stash(const bf16*, bf16*, bf16*, int, cudaStream_t);
+extern void launch_relu2_bwd(const bf16*, const bf16*, bf16*, int, cudaStream_t);
+extern void launch_top2_gating(const bf16*, float*, int*, float*, int, int, float, const int*, int, const float*, cudaStream_t);
+extern void launch_top2_gating_count(const bf16*, float*, int*, float*, int*, int, int, float, const int*, int, const float*, cudaStream_t);
+extern void launch_update_expert_biases(float*, const int*, int, int, int, float, cudaStream_t);
 
 extern void launch_scatter_combine(const bf16*, const bf16*, const int*, const float*,
                                    bf16*, int, int, int, cudaStream_t);
@@ -139,6 +144,19 @@ static void mask_ternary_gradient(float* fp32, float* alpha_scratch,
 static bool sparse_moe_enabled() {
     const char* v = std::getenv("JARVIS_MOE_SPARSE");
     return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
+}
+
+static bool use_relu2() {
+    const char* v = std::getenv("JARVIS_ACTIVATION");
+    return v && (std::strcmp(v, "relu2") == 0 || std::strcmp(v, "squared_relu") == 0);
+}
+
+static bool aux_loss_free_enabled(const JarvisConfig& cfg) {
+    const char* v = std::getenv("JARVIS_AUX_FREE");
+    if (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y')) return true;
+    if (v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N')) return false;
+    // Default to aux-free when balance_alpha is 0
+    return cfg.balance_alpha <= 0.0f;
 }
 
 static float router_noise_std() {
@@ -478,11 +496,12 @@ static void layer_core(JarvisEngine& E, int l, const bf16* xin) {
     launch_rmsnorm_fwd(x2, P.norm2_w[l], ws.norm2_out, nullptr, NT, C, s);
 
     lt.router_fwd(ws.norm2_out, P.router_w[l], ws.router_logits, NT, C, Ee, s);
+    const float* bias_l = ws.expert_biases ? (ws.expert_biases + (size_t)l * Ee) : nullptr;
     if (sparse_moe_enabled()) {
         CUDA_CHECK(cudaMemsetAsync(ws.expert_counts, 0, (size_t)Ee * sizeof(int), s));
         launch_top2_gating_count(ws.router_logits, ws.router_probs, ws.topk_idx,
                                  ws.topk_gates, ws.expert_counts, NT, Ee,
-                                 router_noise_std(), ws.adam_step, l, s);
+                                 router_noise_std(), ws.adam_step, l, bias_l, s);
         launch_expert_offsets(ws.expert_counts, ws.expert_offsets, Ee, s);
         const std::vector<int> counts = read_expert_counts(ws, Ee, s);
         launch_sparse_dispatch(ws.norm2_out, ws.topk_idx, ws.dispatch_x, ws.route_pos,
@@ -497,7 +516,11 @@ static void layer_core(JarvisEngine& E, int l, const bf16* xin) {
                 lt.gemm_fp8_cached(rows, hi, C, x,
                     P.expert_w1[l] + (size_t)e * hi * C,
                     ws.w1_q8[l] + (size_t)e * hi * C, ws.w1_inv[l], h1, s);
-                launch_gelu_fwd_stash(h1, pre, h1, rows * hi, s);
+                if (use_relu2()) {
+                    launch_relu2_fwd_stash(h1, pre, h1, rows * hi, s);
+                } else {
+                    launch_gelu_fwd_stash(h1, pre, h1, rows * hi, s);
+                }
                 lt.gemm_fp8_cached(rows, C, hi, h1,
                     P.expert_w2[l] + (size_t)e * C * hi,
                     ws.w2_q8[l] + (size_t)e * C * hi, ws.w2_inv[l],
@@ -510,15 +533,21 @@ static void layer_core(JarvisEngine& E, int l, const bf16* xin) {
                                   NT, cfg.top_k, C, s);
     } else {
         launch_top2_gating(ws.router_logits, ws.router_probs, ws.topk_idx,
-                           ws.topk_gates, NT, Ee, router_noise_std(), ws.adam_step, l, s);
+                           ws.topk_gates, NT, Ee, router_noise_std(), ws.adam_step, l, bias_l, s);
         for (int e = 0; e < Ee; ++e) {
             lt.gemm_fp8_cached(NT, hi, C, ws.norm2_out,
                                P.expert_w1[l] + (size_t)e * hi * C,
                                ws.w1_q8[l] + (size_t)e * hi * C, ws.w1_inv[l],
                                ws.layer_h1 + (size_t)e * NT * hi, s);
-            launch_gelu_fwd_stash(ws.layer_h1 + (size_t)e * NT * hi,
-                                  ws.stash_h1 + (size_t)e * NT * hi,
-                                  ws.layer_h1 + (size_t)e * NT * hi, NT * hi, s);
+            if (use_relu2()) {
+                launch_relu2_fwd_stash(ws.layer_h1 + (size_t)e * NT * hi,
+                                      ws.stash_h1 + (size_t)e * NT * hi,
+                                      ws.layer_h1 + (size_t)e * NT * hi, NT * hi, s);
+            } else {
+                launch_gelu_fwd_stash(ws.layer_h1 + (size_t)e * NT * hi,
+                                      ws.stash_h1 + (size_t)e * NT * hi,
+                                      ws.layer_h1 + (size_t)e * NT * hi, NT * hi, s);
+            }
             lt.gemm_fp8_cached(NT, C, hi,
                                ws.layer_h1 + (size_t)e * NT * hi,
                                P.expert_w2[l] + (size_t)e * C * hi,
@@ -555,8 +584,10 @@ void JarvisEngine::forward_microstep(int ustep) {
                                    (size_t)NT * C * sizeof(bf16), cudaMemcpyDeviceToDevice, s));
         layer_core(*this, l, ws.layer_x);
 
-        launch_accumulate_load_balance_loss(ws.router_probs, ws.topk_idx, ws.l_balance,
-                                            cfg.balance_alpha / cfg.accum_steps, NT, E, s);
+        if (!aux_loss_free_enabled(cfg) && cfg.balance_alpha > 0.0f) {
+            launch_accumulate_load_balance_loss(ws.router_probs, ws.topk_idx, ws.l_balance,
+                                                cfg.balance_alpha / cfg.accum_steps, NT, E, s);
+        }
         if (l == L - 1) {
             launch_reflective_penalty(ws.norm2_out, ws.mu_running, ws.l_reflect,
                                       cfg.reflect_lambda / cfg.accum_steps,
@@ -631,8 +662,10 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
                 ws.route_pos, ws.expert_offsets, ws.topk_gates,
                 ws.d_dispatch, ws.dg, NT, cfg.top_k, C, s);
             launch_router_bwd2(ws.router_probs, ws.topk_idx, ws.dg, ws.d_rlogits, NT, s);
-            launch_load_balance_grad(ws.router_probs, ws.topk_idx, ws.d_rlogits,
-                                     cfg.balance_alpha / cfg.accum_steps, NT, E, s);
+            if (!aux_loss_free_enabled(cfg) && cfg.balance_alpha > 0.0f) {
+                launch_load_balance_grad(ws.router_probs, ws.topk_idx, ws.d_rlogits,
+                                         cfg.balance_alpha / cfg.accum_steps, NT, E, s);
+            }
             const std::vector<int> counts = read_expert_counts(ws, E, s);
             CUDA_CHECK(cudaMemsetAsync(ws.d_norm2, 0, (size_t)NT * C * sizeof(bf16), s));
             int offset = 0;
@@ -648,7 +681,11 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
                     GemmDesc d1 = {rows, hi, C};
                     lt.gemm_nn(d1, dy_e, params.expert_w2[l] + (size_t)e * C * hi,
                                dh_e, 1.0f, 0.0f, s);
-                    launch_gelu_bwd(h1_pre, dh_e, dh_e, rows * hi, s);
+                    if (use_relu2()) {
+                        launch_relu2_bwd(h1_pre, dh_e, dh_e, rows * hi, s);
+                    } else {
+                        launch_gelu_bwd(h1_pre, dh_e, dh_e, rows * hi, s);
+                    }
                     const bf16* x_e = ws.dispatch_x + (size_t)offset * C;
                     lt.generic_bwd_dw(dh_e, x_e,
                                       ws.d_exp_w1[l] + (size_t)e * hi * C,
@@ -665,8 +702,10 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
             launch_moe_combine_bwd(ws.d_moe, ws.expert_out, ws.topk_idx, ws.topk_gates,
                                    ws.d_dispatch, ws.dg, NT, C, E, s);
             launch_router_bwd2(ws.router_probs, ws.topk_idx, ws.dg, ws.d_rlogits, NT, s);
-            launch_load_balance_grad(ws.router_probs, ws.topk_idx, ws.d_rlogits,
-                                     cfg.balance_alpha / cfg.accum_steps, NT, E, s);
+            if (!aux_loss_free_enabled(cfg) && cfg.balance_alpha > 0.0f) {
+                launch_load_balance_grad(ws.router_probs, ws.topk_idx, ws.d_rlogits,
+                                         cfg.balance_alpha / cfg.accum_steps, NT, E, s);
+            }
 
             for (int e = 0; e < E; ++e) {
                 const bf16* dy_e = ws.d_dispatch + (size_t)e * NT * C;
@@ -675,9 +714,15 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
                 GemmDesc d1 = {NT, hi, C};
                 lt.gemm_nn(d1, dy_e, params.expert_w2[l] + (size_t)e * C * hi,
                            ws.d_h1 + (size_t)e * NT * hi, 1.0f, 0.0f, s);
-                launch_gelu_bwd(ws.stash_h1 + (size_t)e * NT * hi,
-                                ws.d_h1 + (size_t)e * NT * hi,
-                                ws.d_h1 + (size_t)e * NT * hi, NT * hi, s);
+                if (use_relu2()) {
+                    launch_relu2_bwd(ws.stash_h1 + (size_t)e * NT * hi,
+                                    ws.d_h1 + (size_t)e * NT * hi,
+                                    ws.d_h1 + (size_t)e * NT * hi, NT * hi, s);
+                } else {
+                    launch_gelu_bwd(ws.stash_h1 + (size_t)e * NT * hi,
+                                    ws.d_h1 + (size_t)e * NT * hi,
+                                    ws.d_h1 + (size_t)e * NT * hi, NT * hi, s);
+                }
                 const bf16* dh_e = ws.d_h1 + (size_t)e * NT * hi;
                 lt.generic_bwd_dw(dh_e, ws.norm2_out, ws.d_exp_w1[l] + (size_t)e * hi * C,
                                   hi, C, NT, beta, s);
@@ -802,6 +847,16 @@ void JarvisEngine::optimizer_step() {
                        ws.d_final_norm,
                        lr, b1, b2, eps, 0.0f,
                         ws.d_bc1, ws.d_bc2, ws.d_clip_coef, ws.d_lr, C, s);
+
+    // DeepSeek-V3 Auxiliary-Loss-Free dynamic router bias update
+    if (aux_loss_free_enabled(cfg) && ws.expert_biases) {
+        for (int l = 0; l < L; ++l) {
+            launch_update_expert_biases(
+                ws.expert_biases + (size_t)l * E,
+                ws.expert_counts,
+                cfg.NT(), cfg.top_k, E, 0.005f, s);
+        }
+    }
 }
 
 // ===========================================================================

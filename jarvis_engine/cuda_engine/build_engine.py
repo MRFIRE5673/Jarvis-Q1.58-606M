@@ -66,6 +66,8 @@ def _patched_ext_init(self, *args, **kwargs):
 cpp_ext.CUDAExtension.__init__ = _patched_ext_init
 
 print(f"[build_engine] CUDA: {CUDA_HOME}  torch: {torch.__version__} (platform: {sys.platform})")
+engine_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(engine_dir)
 sys.argv = ["setup.py", "build_ext", "--inplace"]
 import runpy
-runpy.run_path("setup.py", run_name="__main__")
+runpy.run_path(os.path.join(engine_dir, "setup.py"), run_name="__main__")

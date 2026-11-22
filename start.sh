@@ -74,11 +74,10 @@ run_resume() {
         echo "No checkpoint found at data/jarvis_cuda.ckpt. Run fresh training first."
         return 1
     fi
-    read -rp "Resume on dataset cursor (R) or resume at LR 2e-5 (L)? [R/L]: " res_choice
-    case "$res_choice" in
-        [lL]*) export JARVIS_LR="2e-5"; $PYTHON_BIN jarvis_engine/train_cuda.py resume-lr ;;
-        *) $PYTHON_BIN jarvis_engine/train_cuda.py resume-data ;;
-    esac
+    export JARVIS_TRAIN_DATA="data/train_tokens_300m_en25_code75.npy"
+    export JARVIS_TRAIN_TOKENS="400000000"
+    echo "Resuming 300M corpus training from checkpoint..."
+    $PYTHON_BIN jarvis_engine/train_cuda.py resume-data
 }
 
 run_sft() {

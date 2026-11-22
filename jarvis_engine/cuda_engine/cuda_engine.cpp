@@ -230,6 +230,8 @@ void alloc_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     dev_alloc_i32 (&ws.expert_counts, (size_t)E,          "expert_counts");
     dev_alloc_i32 (&ws.expert_offsets, (size_t)E + 1,     "expert_offsets");
     dev_alloc_i32 (&ws.route_write, (size_t)E,             "route_write");
+    dev_alloc_fp32(&ws.expert_biases, (size_t)L * E,       "expert_biases [L,E]");
+    CUDA_CHECK(cudaMemset(ws.expert_biases, 0, (size_t)L * E * sizeof(float)));
     if (sparse_moe_requested_alloc()) {
         dev_alloc_fp32(&ws.route_probs_cache, (size_t)cfg.accum_steps * L * NT * E, "route_probs_cache [A,L,NT,E]");
         dev_alloc_i32(&ws.topk_idx_cache, (size_t)cfg.accum_steps * L * NT * K, "topk_idx_cache [A,L,NT,K]");
@@ -342,6 +344,7 @@ void free_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     FD(ws.norm2_out); FD(ws.router_logits);
     FD(ws.router_probs); FD(ws.topk_idx); FD(ws.topk_gates);
     FD(ws.route_pos); FD(ws.expert_counts); FD(ws.expert_offsets); FD(ws.route_write);
+    FD(ws.expert_biases);
     FD(ws.route_probs_cache); FD(ws.topk_idx_cache); FD(ws.topk_gates_cache);
     FD(ws.route_pos_cache); FD(ws.expert_counts_cache); FD(ws.expert_offsets_cache);
     FD(ws.dispatch_x);FD(ws.layer_h1); FD(ws.expert_out); FD(ws.moe_out);
