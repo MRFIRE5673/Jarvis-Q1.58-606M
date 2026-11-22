@@ -1,155 +1,111 @@
 # Jarvis Q1.58-606M
 
-Sub-quadratic 606M language model architecture combining ternary quantization (1.58-bit), chunked associative linear attention with RoPE, top-2 sparse Mixture-of-Experts (MoE), and liquid state fusion.
+An experimental Windows/CUDA language-model project with a native training engine, a PyTorch model/evaluator, associative attention, and sparse top-2 MoE. The project name says "606M"; the native trainer ties the token embedding and LM head into one matrix while the PyTorch model keeps them separate — so the effective trainable count differs slightly between the two. Treat "606M" as a project label until the two implementations are formally reconciled.
 
----
+## Current state
 
-## Architecture Specifications
+This is a research implementation. The 400M-token core v4 foundation checkpoint (`data/jarvis_cuda.ckpt`, step 48,828) exists and has been validated for training correctness, but currently produces incoherent or empty output on conversational prompts. **The next quality step is instruction tuning (SFT)** via `start.bat > 5 > I`. The SFT dataset is already prepared (`data/assistant_sft_tokens.npy`, 15M code + 5M OASST1 conversation, ~11.5M response targets).
 
-Verified parameter counts and architecture dimensions (606M scale):
+The main architecture settings are 24 blocks, width 1,024, 16 attention heads, a 50,257-token GPT-2 vocabulary, and four experts with top-2 routing. The design includes chunked associative linear attention with RoPE and liquid state fusion. The CUDA engine uses BF16 activations with FP32 master weights and optimizer state. FP8 weight caches are used for supported GEMMs; this does not mean the checkpoint is stored in FP8. On SM120, grouped expert GEMM is disabled and sparse FP8 fallback is used. Dynamic expert batches (sparse mode default) disable CUDA Graph capture.
 
-| Specification | Value | Description |
-| :--- | :---: | :--- |
-| **Total Parameters** | **606,391,704** | Total model weights (embeddings + 24 blocks + LM head) |
-| **Active Parameters / Token** | **405,065,112** | Active parameters per forward pass (~66.8% active via Top-2 MoE) |
-| **Layers** | 24 | Transformer blocks with residual normalization |
-| **Hidden Dimension ($d_{\text{model}}$)** | 1,024 | Internal representation width |
-| **Attention Heads** | 16 | Associative attention heads (Head Dim: 64) |
-| **Vocabulary Size** | 50,257 | GPT-2 BPE tokenizer vocabulary |
-| **MoE Experts** | 4 | 4 routed experts per layer (Top-2 active per token) |
-| **Weight Quantization** | 1.58-bit | Ternary weights $\{-1, 0, +1\}$ trained via Straight-Through Estimator (STE) |
-| **Attention Mechanism** | Sub-quadratic | Chunked associative linear attention with Rotary Embeddings (RoPE) |
-| **Recurrence** | Hybrid | Constant $O(1)$ memory state carry during autoregressive decoding |
+## Start the console
 
----
-
-## Current Status & Honest Grounding
-
-- **Architecture & Kernels:** Fully implemented and passing 100% of correctness gates (forward/backward parity, STE gradient flow, causal invariance, state persistence, and numeric stability).
-- **Native CUDA C++ Engine:** cuBLASLt with BF16 activations, cached FP8 weights, and FP32 optimizer state. Training defaults to route-compacted top-2 MoE; that path disables CUDA Graphs and synchronizes to obtain each expert batch size, so measure throughput on the current build before comparing it with dense graph mode.
-- **Paper-fidelity router:** Set JARVIS_PAPER_FIDELITY=1 to enable Gaussian (σ=0.1) router noise before top-2 selection.
-- **Checkpoints & Training:** This repository contains the architecture, CUDA kernels, and training engine. It does **not** ship with a pretrained dialogue model. Train with `start.bat` option 5 or `python jarvis_engine/train_cuda.py`. A 606M model requires hundreds of millions to billions of tokens to develop natural English fluency and code synthesis.
-
----
-
-## Quickstart Console (`start.bat`)
-
-Run `start.bat` on Windows to access the interactive menu:
+On Windows, run `start.bat` from the repository directory:
 
 ```text
-===================================================
-              JARVIS Q1.58 606M CONSOLE
-===================================================
-  1. Chat / Agent
-  2. One-shot prompt
-  3. Evaluate + benchmark
-  4. Rebuild CUDA engine
-  5. Train / resume
-  0. Exit
-===================================================
+1  Chat / Agent
+2  One-shot prompt
+3  Evaluate + benchmark
+4  Rebuild CUDA engine
+5  Train / resume
+0  Exit
 ```
 
----
+Option 5 asks whether to pretrain (P) or instruction-tune (I). Instruction tuning evaluates the held-out loss before and after, backs up the foundation checkpoint, and runs the SFT pass. For a fresh pretrain run, choose P → F (fresh). The old checkpoint predates core v4; use fresh for a clean run.
 
-## Components
+## Training configuration (current defaults)
 
-### 1. Agentic AI Terminal (`jarvis_engine/jarvis_agent.py`)
-Provides local tool execution and reasoning:
-- **`run_python` / `run_cmd`:** Execute generated Python or shell commands only after an explicit session consent prompt; commands run with the current Windows account's permissions.
-- **`read_file` / `write_file`:** Inspects and modifies files in the workspace.
-- **`gpu_info`:** Queries live NVIDIA VRAM, compute usage, and memory reservations.
+| Setting | Value |
+|---|---|
+| Micro-batch B | 8 |
+| Sequence length T | 512 |
+| Gradient accumulation | 2 |
+| Tokens per optimizer step | 8,192 |
+| Default LR | 2e-5 |
+| Router noise σ | 0.1 |
+| Default token budget | 400M (≈48,828 updates) |
+| Measured throughput | 13,800–18,000 tok/s (RTX 5070, sparse mode; benchmarked: 13,869 tok/s) |
+| Estimated wall time | ~6–8 hours |
 
-Launch via `start.bat` (Option 1) or directly:
-```bash
-python jarvis_engine/jarvis_agent.py
+Set environment variables before calling `start.bat` to override:
+
+```bat
+set JARVIS_TRAIN_TOKENS=300000000
+set JARVIS_LR=2e-5
+start.bat
 ```
 
-### 2. High-Throughput Native CUDA Engine (`jarvis_engine/cuda_engine/`)
-Custom C++/CUDA training engine with zero Python overhead during execution steps:
-- **cuBLASLt GEMM Engine:** Pre-quantized FP8 weights with interleaved MoE W1 $\to$ GELU $\to$ W2 execution to maximize L2 cache hit rate.
-- **CUDA Graph Capture:** Replays the entire forward, backward, optimizer step, and ternary clipping in a single GPU submission.
-- **Binary Checkpoint Format:** Fast serialization directly to/from native host/device memory.
+## Data preparation
 
-To build the native CUDA engine:
-```bash
-cd jarvis_engine/cuda_engine
+The console prepares the 300M mixed corpus if its array or metadata is missing. Before instruction tuning it evaluates the held-out mix, saves `data/jarvis_cuda_pre_sft.ckpt` as a restore point, runs SFT, then evaluates again. Manual commands:
+
+```bat
+python jarvis_engine/prepare_data.py --english-tokens 75000000 --code-tokens 225000000 --output data/train_tokens_300m_en25_code75.npy
+python jarvis_engine/prepare_sft_data.py --tokens 20000000 --chat-tokens 5000000 --output data/assistant_sft_tokens.npy
+```
+
+Preparation streams selected Hugging Face Parquet shards and reports progress. The code filter accepts MIT, ISC, BSD-2-Clause, BSD-3-Clause, Apache-2.0, Unlicense, Zlib, and CC0-1.0. The conversational source is the English, reviewed, non-synthetic subset of OpenAssistant OASST1 (Apache-2.0). Check each dataset's source terms before redistribution.
+
+## Build and run directly
+
+```bat
+cd jarvis_engine\cuda_engine
 python build_engine.py
+cd ..\..
+python jarvis_engine\train_cuda.py fresh
+python jarvis_engine\evaluate_jarvis.py --interactive
 ```
 
-To run the standalone CUDA benchmark:
-```bash
-python jarvis_engine/bench_engine.py
+Local build environment: Windows, Python 3.14, PyTorch 2.11+cu128, CUDA Toolkit 13.3, MSVC 2022 14.44, RTX 5070 SM120. The console rebuild sets `JARVIS_ALLOW_CUDA_MISMATCH=1`.
+
+For a prompt or holdout evaluation:
+
+```bat
+python jarvis_engine/evaluate_jarvis.py --prompt "Write a Python function that adds two numbers." --max_new_tokens 128
+python jarvis_engine/evaluate_jarvis.py --skip-train-eval --skip-gen --eval-file data/assistant_sft_tokens_holdout.txt --num-windows 128 --seq-len 256
 ```
 
-### 3. Data Preparation & Training Pipeline
-- **jarvis_engine/prepare_data.py:** Streams selected Hugging Face Parquet shards into GPT-2 token arrays. The CLI defaults to 20M English tokens; start.bat prepares the 300M-token mix (75M FineWeb-Edu English, 225M license-filtered GitHub Code) in data/train_tokens_300m_en25_code75.npy.
-- **`jarvis_engine/train_cuda.py`:** Executes training passes over the token array with live EMA loss, throughput telemetry, and periodic checkpointing.
-- The native runner uses `B=8`, `T=512`, `accum=2` (8,192 tokens/update), FP32 AdamW state, FP8 weight caches, and a GPU-resident linear-warmup/cosine learning-rate schedule. The default LR is `1e-4`; override it with `JARVIS_LR`. Sparse top-2 routing is the training default; use `JARVIS_MOE_SPARSE=0` for dense graph replay.
+The evaluator uses `max_seq_len=256`; training uses T=512. Evaluate with consistent settings when comparing runs.
 
-```bash
-# Tokenize the CLI's default 20M English-only corpus
-python jarvis_engine/prepare_data.py 20000000
+## Workspace map
 
-# Train with native CUDA engine
-python jarvis_engine/train_cuda.py
-
-# Resume training from existing checkpoint
-python jarvis_engine/train_cuda.py resume
+```text
+jarvis_engine/              Native trainer, PyTorch model, data prep, evaluation, agent
+jarvis_engine/cuda_engine/  Native C++/CUDA engine and build script
+associative_attention_cuda/ PyTorch associative-attention CUDA extension
+sparse_model_cuda/          PyTorch sparse-MoE CUDA extension
+liquid_fusion_cuda/         Liquid-state CUDA prototype
+experiments/                Architecture, optimizer, ternary, and data experiments
+research/                   Paper notes and architectural decision records
+benchmarks/                 Benchmark scripts (results are hardware/build-specific)
+tests/                      Correctness and regression checks
+data/                       Local token arrays, masks, metadata, and checkpoints
+memory.md                   Detailed workspace and operational notes (authoritative)
+start.bat                   Windows menu and training launcher
 ```
 
-### 4. Interactive Evaluation Suite (`jarvis_engine/evaluate_jarvis.py`)
-- Real-time streaming autoregressive decoding using $O(1)$ associative state caching.
-- Perplexity and decoupled cross-entropy evaluation on holdout corpora.
+## Known limitations
 
-```bash
-# Streaming interactive session
-python jarvis_engine/evaluate_jarvis.py --interactive
+- The native trainer and PyTorch model have separate tok_emb and lm_head; checkpoint loading copies the native embedding into both. Parameter count differs slightly between the two implementations.
+- Sparse top-2 routing uses dynamic expert batches and disables CUDA Graphs. The SM120 grouped expert GEMM path is unavailable in the local build.
+- FP8 caches are a forward-pass optimization, not proof of FP8 or ternary optimizer updates.
+- A low training loss does not guarantee useful language generation. Inspect generated samples after training and after SFT.
+- No top-level LICENSE file is present. Verify repository licensing before publishing.
 
-# Single prompt completion
-python jarvis_engine/evaluate_jarvis.py --prompt "def fibonacci(n):" --max_new_tokens 64
+## Correctness checks
 
-# Holdout perplexity evaluation
-python jarvis_engine/evaluate_jarvis.py --eval-file fresh_holdout.txt --num-windows 50
-```
-
----
-
-## Verification & Correctness Tests
-
-Run the regression suite covering forward/backward parity, STE quantization gradient flow, causal invariance, state persistence, and numeric stability:
-
-```bash
+```bat
 python tests/test_correctness_gate.py
 ```
 
----
-
-## Repository Structure
-
-```
-Jarvis-Q1.58-606M/
-├── jarvis_engine/
-│   ├── jarvis_model.py             # 606M PyTorch model definition (RoPE, MoE, LSF, Ternary)
-│   ├── jarvis_agent.py             # Agentic AI terminal with local tool execution
-│   ├── evaluate_jarvis.py          # Interactive CLI and holdout evaluation
-│   ├── train_cuda.py               # Native CUDA training runner
-│   ├── prepare_data.py             # FineWeb-Edu tokenization pipeline
-│   ├── bench_engine.py             # Engine speed benchmark script
-│   └── cuda_engine/                # Native C++/CUDA cuBLASLt training engine
-│       ├── build_engine.py         # MSVC/NVCC build script
-│       ├── cublaslt_engine.cu      # Fast cuBLASLt GEMM routines
-│       ├── full_engine.cu          # Fused forward/backward/graph execution
-│       └── core_kernels.cu         # Elementwise, norm, and ternary kernels
-├── associative_attention_cuda/     # PyTorch custom CUDA extension for associative attention
-├── sparse_model_cuda/              # PyTorch custom CUDA extension for sparse MoE
-├── tests/                          # Rigorous numerical parity & correctness gate suites
-├── experiments/                    # Research and ablation scripts
-├── start.bat                       # One-click Windows console launcher
-└── README.md                       # Repository documentation
-```
-
----
-
-## License
-
-Apache License 2.0. See [LICENSE](LICENSE) for details.
+Run after any change to model math or CUDA kernels.

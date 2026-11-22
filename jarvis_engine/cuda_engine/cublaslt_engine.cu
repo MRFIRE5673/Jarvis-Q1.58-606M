@@ -173,6 +173,11 @@ void CublasLtEngine::gemm_fp8_cached(int M, int N, int K,
                                       const bf16* X, const bf16* W_bf16,
                                       const uint8_t* W_q8, const float* d_inv_w,
                                       bf16* Y, cudaStream_t s) const {
+    if (!fp8_fwd) {
+        gemm({M, N, K}, X, W_bf16, Y, 1.f, 0.f, s);
+        return;
+    }
+
     cublasLtMatmulDesc_t op;
     CUBLAS_CHECK((cublasStatus_t)cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
     cublasOperation_t T = CUBLAS_OP_T, Nn = CUBLAS_OP_N;

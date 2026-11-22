@@ -288,8 +288,9 @@ void launch_rmsnorm_bwd(
 __global__ void online_xent_bwd_kernel(
     bf16*         __restrict__ logits,
     const int*    __restrict__ tok_ids,
+    const unsigned char* __restrict__ target_mask,
     float*        __restrict__ loss_acc,
-    int B, int T, int Vpad, int accum_steps
+    int B, int T, int Vpad, int accum_steps, int active_targets
 ) {
     extern __shared__ float smem[];  // per-warp max, sum, and label buffers
     float* s_max_buf = smem;
@@ -310,9 +311,17 @@ __global__ void online_xent_bwd_kernel(
         return;
     }
 
+    if (target_mask && target_mask[row + 1] == 0) {
+        for (int v = threadIdx.x; v < Vpad; v += BLOCK)
+            logits[base + v] = __float2bfloat16(0.0f);
+        return;
+    }
+
     // Within-sequence target token: tok_ids[row + 1] (strictly within the same sequence)
     int lbl = __ldg(tok_ids + row + 1);
-    float scale = 1.0f / ((float)B * (float)(T - 1) * (float)accum_steps);
+    float denominator = target_mask ? (float)active_targets :
+        (float)B * (float)(T - 1) * (float)accum_steps;
+    float scale = 1.0f / fmaxf(denominator, 1.0f);
 
     // Pass 1a: parallel max
     float row_max = -FLT_MAX;
@@ -384,13 +393,15 @@ __global__ void online_xent_bwd_kernel(
 }
 
 void launch_online_xent_bwd(
-    bf16* logits, const int* tok_ids, float* loss,
-    int B, int T, int Vpad, int accum_steps, int ustep, cudaStream_t s
+    bf16* logits, const int* tok_ids, const unsigned char* target_mask,
+    float* loss, int B, int T, int Vpad, int accum_steps,
+    int active_targets, int ustep, cudaStream_t s
 ) {
     if (ustep == 0) cudaMemsetAsync(loss, 0, sizeof(float), s);
     int NT = B * T;
     size_t smem = 64 * sizeof(float);  // 2×32 for max+sum reductions
-    online_xent_bwd_kernel<<<NT, 256, smem, s>>>(logits, tok_ids, loss, B, T, Vpad, accum_steps);
+    online_xent_bwd_kernel<<<NT, 256, smem, s>>>(
+        logits, tok_ids, target_mask, loss, B, T, Vpad, accum_steps, active_targets);
     CUDA_CHECK_LAST();
 }
 

@@ -7,8 +7,7 @@
 //   Membrane state H persists across token positions (temporal memory).
 //
 // Implementation (RTX 5070):
-//   alpha computation: parallel reduction for mean/var of M[NT, C]
-//     → one block, stride loop, warp-reduce, single-thread final
+//   alpha computation: two-stage reduction for global mean/var of M[NT, C]
 //   EMA forward: serial T-step scan per (b, dim_block) pair
 //     → cannot be parallelized across T (causal dependency)
 //     → parallelized across batch B and C dimension blocks
@@ -21,7 +20,7 @@
 void launch_compute_lsf_alpha(
     const __nv_bfloat16* M,  // [NT, C]
     float var_scale, float alpha_min, float alpha_max,
-    float* alpha_out,         // [1] FP32 output
+    float* alpha_out,         // alpha, global mean, and reduction scratch
     int NT, int C, cudaStream_t s
 );
 
@@ -47,11 +46,25 @@ void launch_lsf_bwd(
     int B, int T, int C, cudaStream_t s
 );
 
+void launch_lsf_alpha_bwd(
+    const __nv_bfloat16* M, const float* alpha_stats, const float* grad_alpha,
+    __nv_bfloat16* grad_M, float var_scale, float alpha_min, float alpha_max,
+    int NT, int C, cudaStream_t s
+);
+
 // Reflective regularization penalty (architecture.md §4.5)
 void launch_reflective_penalty(
-    const __nv_bfloat16* M,     // [NT, C] moe_out for stats
-    float*       mu_running,     // [1] EMA mean (updated in-place)
+    const __nv_bfloat16* M,     // [NT, C] hidden activations for stats
+    float*       mu_running,     // [1] EMA target, updated by backward
     float*       l_reflect,      // [1] output loss
+    float lambda, float tau_max, float ema_decay,
+    int NT, int C, cudaStream_t s
+);
+
+void launch_reflective_penalty_bwd(
+    const __nv_bfloat16* M,     // [NT, C] hidden activations
+    float* mu_running,          // [1] updated once after the gradient is computed
+    __nv_bfloat16* grad_M,      // [NT, C] gradient accumulator, updated in-place
     float lambda, float tau_max, float ema_decay,
     int NT, int C, cudaStream_t s
 );

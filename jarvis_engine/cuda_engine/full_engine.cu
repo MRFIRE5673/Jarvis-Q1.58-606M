@@ -42,7 +42,8 @@ extern void launch_fused_add_rmsnorm_fwd(const bf16*, const bf16*, const bf16*,
                                           bf16*, float*, int, int, float, cudaStream_t);
 extern void launch_fused_stash_add_rmsnorm_fwd(const bf16*, const bf16*, const bf16*,
                                                 bf16*, bf16*, float*, int, int, float, cudaStream_t);
-extern void launch_online_xent_bwd(bf16*, const int*, float*, int, int, int, int, int, cudaStream_t);
+extern void launch_online_xent_bwd(bf16*, const int*, const unsigned char*, float*,
+                                   int, int, int, int, int, int, cudaStream_t);
 extern void launch_add_residual(const bf16*, const bf16*, bf16*, int, cudaStream_t);
 extern void launch_grad_norm_sq(const bf16*, float*, int, cudaStream_t);
 extern void launch_compute_clip_coef(const float*, float*, float, cudaStream_t);
@@ -59,6 +60,7 @@ extern void launch_assoc_attn_fwd(const bf16*, const bf16*, const bf16*, const f
 extern void launch_dispatch_gather(const bf16*, const int*, bf16*, int, int, int, cudaStream_t);
 extern void launch_sparse_dispatch(const bf16*, const int*, bf16*, int*, int*, const int*, int, int, int, int, cudaStream_t);
 extern void launch_sparse_combine_fwd(const bf16*, const bf16*, const int*, const int*, const int*, const float*, bf16*, int, int, int, cudaStream_t);
+extern void launch_sparse_input_grad_combine(const bf16*, const int*, const int*, const int*, bf16*, int, int, int, cudaStream_t);
 extern void launch_sparse_combine_bwd(const bf16*, const bf16*, const int*, const int*, const int*, const float*, bf16*, float*, int, int, int, cudaStream_t);
 extern void launch_gelu_fwd_inplace(bf16*, int, cudaStream_t);
 extern void launch_gelu_fwd_stash(const bf16*, bf16*, bf16*, int, cudaStream_t);
@@ -67,16 +69,21 @@ extern void launch_gelu_bwd(const bf16*, const bf16*, bf16*, int, cudaStream_t);
 extern void launch_scatter_combine(const bf16*, const bf16*, const int*, const float*,
                                    bf16*, int, int, int, cudaStream_t);
 extern void launch_load_balance_loss(const float*, const int*, float*, float, int, int, cudaStream_t);
+extern void launch_accumulate_load_balance_loss(const float*, const int*, float*, float, int, int, cudaStream_t);
+extern void launch_load_balance_grad(const float*, const int*, bf16*, float, int, int, cudaStream_t);
 
 // liquid_state_fusion.cu
 extern void launch_compute_lsf_alpha(const bf16*, float, float, float, float*, int, int, cudaStream_t);
 extern void launch_lsf_fwd(const bf16*, const float*, bf16*, bf16*, int, int, int, cudaStream_t);
 extern void launch_reflective_penalty(const bf16*, float*, float*, float, float, float, int, int, cudaStream_t);
+extern void launch_reflective_penalty_bwd(const bf16*, float*, bf16*, float, float, float, int, int, cudaStream_t);
 
 // ternary.cu (launchers only — NOT #included)
 extern void launch_ternary_abs_mean(const float*, float*, int, cudaStream_t);
 extern void launch_ternary_quantize(const float*, const float*, bf16*, int, cudaStream_t);
 extern void launch_ternary_ste_mask(const float*, const float*, bf16*, int, cudaStream_t);
+extern void launch_paper_ternary_quantize(const float*, bf16*, int, cudaStream_t);
+extern void launch_paper_ternary_ste_mask(const float*, bf16*, int, cudaStream_t);
 
 // backward.cu
 extern void launch_grad_accum(const bf16*, bf16*, float, int, cudaStream_t);
@@ -93,6 +100,7 @@ extern void launch_router_bwd2(const float*, const int*, const float*, bf16*, in
 extern void launch_emb_bwd2(const int*, const bf16*, bf16*, int, int, cudaStream_t);
 extern void launch_f32_to_bf16(const float*, bf16*, int, cudaStream_t);
 extern void launch_lsf_bwd(const bf16*, const bf16*, const bf16*, const float*, bf16*, float*, int, int, int, cudaStream_t);
+extern void launch_lsf_alpha_bwd(const bf16*, const float*, const float*, bf16*, float, float, float, int, int, cudaStream_t);
 
 // ---------------------------------------------------------------------------
 // Global engine singleton
@@ -108,8 +116,24 @@ extern void quant_fp8_device(const bf16* x, uint8_t* y, int rows, int cols, bool
 // ---------------------------------------------------------------------------
 static void quantize_weight(float* fp32, float* alpha_scratch,
                              bf16* bf16_out, int N, cudaStream_t s) {
+    const char* fidelity = std::getenv("JARVIS_PAPER_FIDELITY");
+    if (fidelity && (fidelity[0] == '1' || fidelity[0] == 'y' || fidelity[0] == 'Y')) {
+        launch_paper_ternary_quantize(fp32, bf16_out, N, s);
+        return;
+    }
     launch_ternary_abs_mean(fp32, alpha_scratch, N, s);
     launch_ternary_quantize(fp32, alpha_scratch, bf16_out, N, s);
+}
+
+static void mask_ternary_gradient(float* fp32, float* alpha_scratch,
+                                  bf16* grad, int N, cudaStream_t s) {
+    const char* fidelity = std::getenv("JARVIS_PAPER_FIDELITY");
+    if (fidelity && (fidelity[0] == '1' || fidelity[0] == 'y' || fidelity[0] == 'Y')) {
+        launch_paper_ternary_ste_mask(fp32, grad, N, s);
+        return;
+    }
+    launch_ternary_abs_mean(fp32, alpha_scratch, N, s);
+    launch_ternary_ste_mask(fp32, alpha_scratch, grad, N, s);
 }
 
 static bool sparse_moe_enabled() {
@@ -118,8 +142,10 @@ static bool sparse_moe_enabled() {
 }
 
 static float router_noise_std() {
-    const char* v = std::getenv("JARVIS_PAPER_FIDELITY");
-    return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y') ? 0.1f : 0.0f;
+    const char* v = std::getenv("JARVIS_ROUTER_NOISE");
+    if (!v) return 0.1f;
+    float sigma = std::strtof(v, nullptr);
+    return sigma > 0.0f ? sigma : 0.0f;
 }
 
 static std::vector<int> read_expert_counts(JarvisWorkspace& ws, int experts,
@@ -149,6 +175,8 @@ void JarvisEngine::init(const JarvisConfig& config, int device) {
 
     alloc_params(params, cfg);
     alloc_workspace(ws, cfg);
+    ws.use_target_mask = false;
+    ws.active_target_count = 0;
 
     // RoPE tables [T, D] FP32
     size_t rope_sz = (size_t)cfg.seq_len * cfg.head_dim * sizeof(float);
@@ -182,7 +210,6 @@ void JarvisEngine::quantize_all_weights() {
     const int C  = cfg.d_model;
     const int E  = cfg.n_experts;
     const int hi = cfg.expert_hidden;
-
     for (int l = 0; l < L; ++l) {
         quantize_weight(params.qkv_fp32[l],    quant_alpha, params.qkv_w[l],   3*C*C,   s);
         quantize_weight(params.out_fp32[l],    quant_alpha, params.out_w[l],   C*C,     s);
@@ -321,6 +348,7 @@ void JarvisEngine::forward_microstep(int ustep) {
         // Write LSF output directly into layer_x — eliminates D2D memcpy
         launch_lsf_fwd(ws.moe_out, ws.lsf_alpha,
                        H_layer, ws.layer_x, B, T, C, s);
+
     }
     lt.fp8_fwd = false;  // LM head + backward stay BF16
 
@@ -454,7 +482,7 @@ static void layer_core(JarvisEngine& E, int l, const bf16* xin) {
         CUDA_CHECK(cudaMemsetAsync(ws.expert_counts, 0, (size_t)Ee * sizeof(int), s));
         launch_top2_gating_count(ws.router_logits, ws.router_probs, ws.topk_idx,
                                  ws.topk_gates, ws.expert_counts, NT, Ee,
-                                 router_noise_std(), ws.adam_step, 0, s);
+                                 router_noise_std(), ws.adam_step, l, s);
         launch_expert_offsets(ws.expert_counts, ws.expert_offsets, Ee, s);
         const std::vector<int> counts = read_expert_counts(ws, Ee, s);
         launch_sparse_dispatch(ws.norm2_out, ws.topk_idx, ws.dispatch_x, ws.route_pos,
@@ -477,12 +505,12 @@ static void layer_core(JarvisEngine& E, int l, const bf16* xin) {
             }
             offset += rows;
         }
-        launch_sparse_combine_fwd(ws.expert_out, x2, ws.topk_idx, ws.route_pos,
+        launch_sparse_combine_fwd(ws.expert_out, nullptr, ws.topk_idx, ws.route_pos,
                                   ws.expert_offsets, ws.topk_gates, ws.moe_out,
                                   NT, cfg.top_k, C, s);
     } else {
         launch_top2_gating(ws.router_logits, ws.router_probs, ws.topk_idx,
-                           ws.topk_gates, NT, Ee, router_noise_std(), ws.adam_step, 0, s);
+                           ws.topk_gates, NT, Ee, router_noise_std(), ws.adam_step, l, s);
         for (int e = 0; e < Ee; ++e) {
             lt.gemm_fp8_cached(NT, hi, C, ws.norm2_out,
                                P.expert_w1[l] + (size_t)e * hi * C,
@@ -497,7 +525,7 @@ static void layer_core(JarvisEngine& E, int l, const bf16* xin) {
                                ws.w2_q8[l] + (size_t)e * C * hi, ws.w2_inv[l],
                                ws.expert_out + (size_t)e * NT * C, s);
         }
-        launch_moe_combine_fwd(ws.expert_out, x2, ws.topk_idx, ws.topk_gates,
+        launch_moe_combine_fwd(ws.expert_out, nullptr, ws.topk_idx, ws.topk_gates,
                                ws.moe_out, NT, C, s);
     }
 
@@ -510,7 +538,7 @@ void JarvisEngine::forward_microstep(int ustep) {
     auto& rt = get_runtime();
     cudaStream_t s = rt.get_stream();
     auto& lt = get_cublaslt();
-    lt.fp8_fwd = false;
+    lt.fp8_fwd = true;
 
     const int NT = cfg.NT(), L = cfg.n_layers, C = cfg.d_model, E = cfg.n_experts;
     const int B = cfg.batch_size, T = cfg.seq_len, Vp = cfg.vocab_padded;
@@ -519,27 +547,35 @@ void JarvisEngine::forward_microstep(int ustep) {
     launch_tok_emb_fwd(tok_ids, params.tok_emb, ws.layer_x, NT, C, s);
     // Each microbatch is an independent sequence set: reset LSF membrane state
     CUDA_CHECK(cudaMemsetAsync(ws.lsf_h, 0, (size_t)L * B * C * sizeof(bf16), s));
+    CUDA_CHECK(cudaMemsetAsync(ws.l_balance, 0, sizeof(float), s));
+    CUDA_CHECK(cudaMemsetAsync(ws.l_reflect, 0, sizeof(float), s));
 
     for (int l = 0; l < L; ++l) {
         CUDA_CHECK(cudaMemcpyAsync(ws.stash_x + (size_t)l * NT * C, ws.layer_x,
                                    (size_t)NT * C * sizeof(bf16), cudaMemcpyDeviceToDevice, s));
         layer_core(*this, l, ws.layer_x);
 
+        launch_accumulate_load_balance_loss(ws.router_probs, ws.topk_idx, ws.l_balance,
+                                            cfg.balance_alpha / cfg.accum_steps, NT, E, s);
         if (l == L - 1) {
-        launch_load_balance_loss(ws.router_probs, ws.topk_idx, ws.l_balance, cfg.balance_alpha, NT, E, s);
-        launch_reflective_penalty(ws.norm2_out, ws.mu_running, ws.l_reflect,
-                                  cfg.reflect_lambda, cfg.reflect_tau_max, 0.99f, NT, C, s);
+            launch_reflective_penalty(ws.norm2_out, ws.mu_running, ws.l_reflect,
+                                      cfg.reflect_lambda / cfg.accum_steps,
+                                      cfg.reflect_tau_max, 0.99f, NT, C, s);
         }
 
         float var_scale = (params.lsf_vscale && params.lsf_vscale[l]) ? cfg.lsf_var_scale : 1.0f;
         launch_compute_lsf_alpha(ws.moe_out, var_scale, cfg.lsf_alpha_min, cfg.lsf_alpha_max,
                                  ws.lsf_alpha, NT, C, s);
         launch_lsf_fwd(ws.moe_out, ws.lsf_alpha, ws.lsf_h + (size_t)l * B * C, ws.layer_x, B, T, C, s);
+        launch_add_residual(ws.layer_x2, ws.layer_x, ws.layer_x, NT * C, s);
     }
 
     launch_rmsnorm_fwd(ws.layer_x, params.final_norm_w, ws.layer_x2, nullptr, NT, C, s);
     lt.lm_head(ws.layer_x2, params.tok_emb, ws.logits, NT, C, Vp, s);
-    launch_online_xent_bwd(ws.logits, tok_ids, ws.loss, B, T, Vp, cfg.accum_steps, ustep, s);
+    const unsigned char* target_mask = ws.use_target_mask
+        ? ws.target_mask + (size_t)ustep * NT : nullptr;
+    launch_online_xent_bwd(ws.logits, tok_ids, target_mask, ws.loss, B, T, Vp,
+                           cfg.accum_steps, ws.active_target_count, ustep, s);
     launch_combine_aux_loss(ws.loss, ws.l_balance, ws.l_reflect, s);
 }
 
@@ -571,14 +607,22 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
     for (int l = L - 1; l >= 0; --l) {
         const bf16* xin = ws.stash_x + (size_t)l * NT * C;
         layer_core(*this, l, xin);          // recompute activations of layer l
-        bf16* x2 = ws.dispatch_x;
+        const bf16* x2 = ws.layer_x2;
 
         // LSF backward (alpha treated as constant)
         float var_scale = (params.lsf_vscale && params.lsf_vscale[l]) ? cfg.lsf_var_scale : 1.0f;
         launch_compute_lsf_alpha(ws.moe_out, var_scale, cfg.lsf_alpha_min, cfg.lsf_alpha_max,
                                  ws.lsf_alpha, NT, C, s);
-        const bf16* Hout = (l == L - 1) ? ws.layer_x : ws.stash_x + (size_t)(l + 1) * NT * C;
-        launch_lsf_bwd(ws.d_x, Hout, Hout, ws.lsf_alpha, ws.d_moe, ws.dg, B, T, C, s);
+        bf16* lsf_state = ws.lsf_h + (size_t)l * B * C;
+        CUDA_CHECK(cudaMemsetAsync(lsf_state, 0, (size_t)B * C * sizeof(bf16), s));
+        launch_lsf_fwd(ws.moe_out, ws.lsf_alpha, lsf_state, ws.layer_x, B, T, C, s);
+        float* grad_alpha = ws.lsf_alpha + kLsfAlphaGradOffset;
+        CUDA_CHECK(cudaMemsetAsync(grad_alpha, 0, sizeof(float), s));
+        launch_lsf_bwd(ws.d_x, ws.moe_out, ws.layer_x, ws.lsf_alpha,
+                       ws.d_moe, grad_alpha, B, T, C, s);
+        launch_lsf_alpha_bwd(ws.moe_out, ws.lsf_alpha, grad_alpha, ws.d_moe,
+                             var_scale, cfg.lsf_alpha_min, cfg.lsf_alpha_max,
+                             NT, C, s);
         // ws.d_moe = dm = grad wrt m (and, via the residual, wrt x2)
 
         // MoE combine backward -> per-expert dy, gate grads -> router logit grads
@@ -587,10 +631,11 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
                 ws.route_pos, ws.expert_offsets, ws.topk_gates,
                 ws.d_dispatch, ws.dg, NT, cfg.top_k, C, s);
             launch_router_bwd2(ws.router_probs, ws.topk_idx, ws.dg, ws.d_rlogits, NT, s);
+            launch_load_balance_grad(ws.router_probs, ws.topk_idx, ws.d_rlogits,
+                                     cfg.balance_alpha / cfg.accum_steps, NT, E, s);
             const std::vector<int> counts = read_expert_counts(ws, E, s);
             CUDA_CHECK(cudaMemsetAsync(ws.d_norm2, 0, (size_t)NT * C * sizeof(bf16), s));
             int offset = 0;
-            bool first = true;
             for (int e = 0; e < E; ++e) {
                 const int rows = counts[e];
                 if (rows > 0) {
@@ -604,20 +649,24 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
                     lt.gemm_nn(d1, dy_e, params.expert_w2[l] + (size_t)e * C * hi,
                                dh_e, 1.0f, 0.0f, s);
                     launch_gelu_bwd(h1_pre, dh_e, dh_e, rows * hi, s);
-                    lt.generic_bwd_dw(dh_e, ws.norm2_out,
+                    const bf16* x_e = ws.dispatch_x + (size_t)offset * C;
+                    lt.generic_bwd_dw(dh_e, x_e,
                                       ws.d_exp_w1[l] + (size_t)e * hi * C,
                                       hi, C, rows, beta, s);
                     GemmDesc d2 = {rows, C, hi};
                     lt.gemm_nn(d2, dh_e, params.expert_w1[l] + (size_t)e * hi * C,
-                               ws.d_norm2, 1.0f, first ? 0.0f : 1.0f, s);
-                    first = false;
+                               ws.d_dispatch + (size_t)offset * C, 1.0f, 0.0f, s);
                 }
                 offset += rows;
             }
+            launch_sparse_input_grad_combine(ws.d_dispatch, ws.topk_idx, ws.route_pos,
+                ws.expert_offsets, ws.d_norm2, NT, cfg.top_k, C, s);
         } else {
             launch_moe_combine_bwd(ws.d_moe, ws.expert_out, ws.topk_idx, ws.topk_gates,
                                    ws.d_dispatch, ws.dg, NT, C, E, s);
             launch_router_bwd2(ws.router_probs, ws.topk_idx, ws.dg, ws.d_rlogits, NT, s);
+            launch_load_balance_grad(ws.router_probs, ws.topk_idx, ws.d_rlogits,
+                                     cfg.balance_alpha / cfg.accum_steps, NT, E, s);
 
             for (int e = 0; e < E; ++e) {
                 const bf16* dy_e = ws.d_dispatch + (size_t)e * NT * C;
@@ -642,8 +691,14 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
         GemmDesc dr = {NT, C, E};
         lt.gemm_nn(dr, ws.d_rlogits, params.router_w[l], ws.d_norm2, 1.0f, 1.0f, s);
 
+        if (l == L - 1) {
+            launch_reflective_penalty_bwd(ws.norm2_out, ws.mu_running, ws.d_norm2,
+                cfg.reflect_lambda / cfg.accum_steps, cfg.reflect_tau_max,
+                0.99f, NT, C, s);
+        }
+
         // norm2 backward (+ residual dm) -> grad wrt x2 (in d_moe)
-        launch_rmsnorm_bwd(x2, params.norm2_w[l], ws.d_norm2, ws.d_moe, ws.d_moe, nullptr, NT, C, s);
+        launch_rmsnorm_bwd(x2, params.norm2_w[l], ws.d_norm2, ws.d_x, ws.d_moe, nullptr, NT, C, s);
 
         // out projection
         lt.generic_bwd_dw(ws.d_moe, ws.attn_out, ws.d_out_w[l], C, C, NT, beta, s);
@@ -663,14 +718,10 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
         if (ustep == cfg.accum_steps - 1) {
             // Apply the Q1.58 STE gate after all microbatch gradients are accumulated,
             // before clipping so masked coordinates do not affect the global norm.
-            launch_ternary_abs_mean(params.qkv_fp32[l], quant_alpha, 3 * C * C, s);
-            launch_ternary_ste_mask(params.qkv_fp32[l], quant_alpha, ws.d_qkv_w[l], 3 * C * C, s);
-            launch_ternary_abs_mean(params.out_fp32[l], quant_alpha, C * C, s);
-            launch_ternary_ste_mask(params.out_fp32[l], quant_alpha, ws.d_out_w[l], C * C, s);
-            launch_ternary_abs_mean(params.exp_w1_fp32[l], quant_alpha, E * hi * C, s);
-            launch_ternary_ste_mask(params.exp_w1_fp32[l], quant_alpha, ws.d_exp_w1[l], E * hi * C, s);
-            launch_ternary_abs_mean(params.exp_w2_fp32[l], quant_alpha, E * C * hi, s);
-            launch_ternary_ste_mask(params.exp_w2_fp32[l], quant_alpha, ws.d_exp_w2[l], E * C * hi, s);
+            mask_ternary_gradient(params.qkv_fp32[l], quant_alpha, ws.d_qkv_w[l], 3 * C * C, s);
+            mask_ternary_gradient(params.out_fp32[l], quant_alpha, ws.d_out_w[l], C * C, s);
+            mask_ternary_gradient(params.exp_w1_fp32[l], quant_alpha, ws.d_exp_w1[l], E * hi * C, s);
+            mask_ternary_gradient(params.exp_w2_fp32[l], quant_alpha, ws.d_exp_w2[l], E * C * hi, s);
 
             launch_grad_norm_sq(ws.d_qkv_w[l],   ws.grad_norm_sq, 3 * C * C,  s);
             launch_grad_norm_sq(ws.d_out_w[l],   ws.grad_norm_sq, C * C,      s);
@@ -699,7 +750,7 @@ void JarvisEngine::optimizer_step() {
     launch_prepare_optimizer_step(
         ws.adam_step, ws.d_bc1, ws.d_bc2, ws.d_clip_coef, ws.d_lr,
         ws.grad_norm_sq, cfg.beta1, cfg.beta2, cfg.grad_clip, cfg.lr,
-        cfg.warmup_steps, cfg.decay_steps, cfg.min_lr_ratio, s);
+        cfg.warmup_steps, cfg.decay_steps, cfg.min_lr_ratio, cfg.lr_step_offset, s);
 
     float lr = cfg.lr, b1 = cfg.beta1, b2 = cfg.beta2;
     float eps = cfg.eps, wd = cfg.weight_decay;
@@ -827,14 +878,25 @@ void JarvisEngine::replay() {
 // ===========================================================================
 // JarvisEngine::train_step
 // ===========================================================================
-float JarvisEngine::train_step(const int* token_ids) {
+float JarvisEngine::train_step(const int* token_ids, const unsigned char* target_mask,
+                               int active_targets) {
     auto& rt = get_runtime();
     cudaStream_t s = rt.get_stream();
+
+    ws.use_target_mask = target_mask != nullptr;
+    ws.active_target_count = ws.use_target_mask ? active_targets : 0;
+    if (ws.use_target_mask) {
+        if (active_targets <= 0)
+            throw std::invalid_argument("Masked training requires at least one active target");
+        CUDA_CHECK(cudaMemcpyAsync(ws.target_mask, target_mask,
+            (size_t)cfg.NT() * cfg.accum_steps * sizeof(unsigned char),
+            cudaMemcpyHostToDevice, s));
+    }
 
     CUDA_CHECK(cudaMemcpyAsync(ws.token_ids, token_ids,
         (size_t)cfg.NT() * cfg.accum_steps * sizeof(int), cudaMemcpyHostToDevice, s));
 
-    if (graph_captured) {
+    if (graph_captured && !ws.use_target_mask) {
         rt.replay();
     } else {
         CUDA_CHECK(cudaMemsetAsync(ws.grad_norm_sq, 0, sizeof(float), s));
@@ -889,6 +951,8 @@ void JarvisEngine::profile_step(const int* token_ids, int n_reps,
 {
     auto& rt = get_runtime();
     cudaStream_t s = rt.get_stream();
+    ws.use_target_mask = false;
+    ws.active_target_count = 0;
 
     // Copy tokens to device if not already there
     CUDA_CHECK(cudaMemcpyAsync(ws.token_ids, token_ids,
@@ -1037,7 +1101,7 @@ void JarvisEngine::load_checkpoint(const char* path) {
                           file_bytes == (std::streamoff)(full_bytes_legacy + sizeof(float));
     if (file_bytes != (std::streamoff)core_bytes && file_bytes != (std::streamoff)routed_bytes && !has_adam)
         throw std::runtime_error("Checkpoint size does not match this model");
-    f.seekg(0, std::ios::beg);
+    f.seekg(sizeof(step_count), std::ios::beg);
 
     auto read_fp32 = [&](float* dev, size_t n) {
         std::vector<float> h(n);

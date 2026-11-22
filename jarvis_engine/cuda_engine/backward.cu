@@ -103,41 +103,44 @@ void launch_grad_norm_sq_fp32(const float* g, float* out, int N, cudaStream_t s)
 }
 
 // ---------------------------------------------------------------------------
-// 4. Router backward
-//    Gate logits grad: d_logits = softmax_grad * d_gate
-//    For sparse top-2: only two experts receive gradient per token.
-//    d_logits[tok, e] = d_gate[tok, k] × d(softmax[k]) for selected k,
-//                     = 0 for non-selected experts.
-//    This is a scalar kernel (NT × E = 2048 × 4 = tiny).
+// 4. Router backward — STE masked-softmax backward (Gumbel-STE router)
+//    Selection (which experts) has no gradient — STE straight-through.
+//    Gate weights are masked-softmax over selected K=2 experts only.
+//
+//    Masked softmax backward (K=2 selected: i0, i1; g0+g1=1):
+//      Approximate g0,g1 from full-softmax probs: g_k = p[i_k]/(p[i0]+p[i1])
+//      d_logit[i0] = g0*(1-g0)*dg0 - g0*g1*dg1
+//      d_logit[i1] = g1*(1-g1)*dg1 - g1*g0*dg0
+//      d_logit[e ∉ {i0,i1}] = 0   (STE: no gradient to unselected experts)
 // ---------------------------------------------------------------------------
 __global__ void router_bwd_kernel(
-    const float* __restrict__ probs,     // [NT, E] softmax probs
-    const float* __restrict__ d_gates,   // [NT, K] gate gradient
-    const int*   __restrict__ topk_idx,  // [NT, K]
-    __nv_bfloat16* __restrict__ d_logits,// [NT, E]
+    const float* __restrict__ probs,      // [NT, E] full softmax — for g0,g1 approx
+    const float* __restrict__ d_gates,    // [NT, K] gate gradient
+    const int*   __restrict__ topk_idx,   // [NT, K] selected expert indices
+    __nv_bfloat16* __restrict__ d_logits, // [NT, E]
     int NT, int E, int K
 ) {
     int tok = blockIdx.x * blockDim.x + threadIdx.x;
     if (tok >= NT) return;
 
-    float p[4] = {0};  // E=4
-    float d_p[4] = {0};
+    int   i0 = topk_idx[tok * K + 0],  i1 = topk_idx[tok * K + 1];
+    float dg0 = d_gates[tok * K + 0],  dg1 = d_gates[tok * K + 1];
 
-    for (int e = 0; e < E; ++e) p[e] = probs[tok * E + e];
+    // Reconstruct masked-softmax gate weights from full-softmax probs
+    float pi0 = probs[tok * E + i0];
+    float pi1 = probs[tok * E + i1];
+    float gsum = pi0 + pi1 + 1e-8f;
+    float g0 = pi0 / gsum;
+    float g1 = pi1 / gsum;
 
-    // Distribute d_gate through softmax Jacobian (dense form)
-    for (int k = 0; k < K; ++k) {
-        int e_sel = topk_idx[tok * K + k];
-        float dg   = d_gates[tok * K + k];
-        // softmax backward: d_logit[e] = p[e] * (delta_{e,e_sel} - p[e_sel]) * dg
-        for (int e = 0; e < E; ++e) {
-            float delta = (e == e_sel) ? 1.0f : 0.0f;
-            d_p[e] += p[e] * (delta - p[e_sel]) * dg;
-        }
+    // Masked softmax Jacobian for K=2:
+    float d_i0 = g0 * (1.0f - g0) * dg0 - g0 * g1 * dg1;
+    float d_i1 = g1 * (1.0f - g1) * dg1 - g1 * g0 * dg0;
+
+    for (int e = 0; e < E; ++e) {
+        float d = (e == i0) ? d_i0 : (e == i1) ? d_i1 : 0.0f;
+        d_logits[tok * E + e] = __float2bfloat16(d);
     }
-
-    for (int e = 0; e < E; ++e)
-        d_logits[tok * E + e] = __float2bfloat16(d_p[e]);
 }
 
 void launch_router_bwd(

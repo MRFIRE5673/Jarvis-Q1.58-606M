@@ -1,0 +1,12 @@
+format=user-assistant-v1
+source=Nan-Do/instructional_code-search-net-python
+license=Apache-2.0
+tokenizer=gpt2
+tokens=20000000
+max_example_tokens=512
+train_examples=72007
+holdout_examples=3862
+holdout_tokens=1064826
+holdout_file=code_instruction_sft_tokens_holdout.txt
+target_mask=code_instruction_sft_tokens_mask.npy
+loss_mask=response-only-v1

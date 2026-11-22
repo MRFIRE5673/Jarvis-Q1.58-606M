@@ -1,21 +1,12 @@
 """
 jarvis_engine/cuda_engine/__init__.py
 ======================================
-Auto-resolving loader for the native CUDA engine .pyd extension.
+Auto-resolving loader for the native CUDA engine extension.
 
-The extension links against:
-  - cublasLt64_13.dll / cudart64_13.dll  (CUDA 13.3 toolkit: bin/x64/)
-  - c10.dll / torch_cpu.dll              (PyTorch lib/)
-
-Windows requires these to be pre-loaded before importing the .pyd.
-This module handles that transparently.
-
-Usage:
-    from jarvis_engine.cuda_engine import eng
-    eng.init()
-    eng.warmup(3)
-    eng.capture_graph()
-    loss = eng.train_step(token_ids_np)
+Cross-platform support:
+  - Windows: loads .pyd and dependent DLLs (cublasLt, cudart, c10, torch_cpu, torch_cuda)
+  - Linux: loads .so and dependent shared objects from standard CUDA and PyTorch lib paths
+  - Safe fallback: if native CUDA engine is absent, symbols default gracefully without crash
 """
 
 import os
@@ -24,53 +15,49 @@ import ctypes
 import glob
 
 # ---------------------------------------------------------------------------
-# 1. Pre-load CUDA 13.x DLLs
+# 1. Pre-load CUDA DLLs / Shared Libraries
 # ---------------------------------------------------------------------------
-_CUDA_BIN_DIRS = [
+_CUDA_SEARCH_PATHS = [
+    os.environ.get("CUDA_HOME", ""),
+    os.environ.get("CUDA_PATH", ""),
     r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64",
     r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin",
     r"C:\CUDA\v13.3\bin\x64",
-]
+    r"C:\CUDA\v13.3\bin",
+    "/usr/local/cuda/lib64",
+    "/usr/local/cuda/lib",
+] + glob.glob(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*\bin\x64") + glob.glob(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*\bin") + glob.glob("/usr/local/cuda-*/lib64")
 
-_CUDA_DLL_LOADED = False
-for _cuda_dir in _CUDA_BIN_DIRS:
-    if os.path.isdir(_cuda_dir):
-        for _dll in os.listdir(_cuda_dir):
-            if _dll.endswith(".dll"):
-                try:
-                    ctypes.CDLL(os.path.join(_cuda_dir, _dll))
-                except Exception:
-                    pass
-        _CUDA_DLL_LOADED = True
-        break
-
-if not _CUDA_DLL_LOADED:
-    import warnings
-    warnings.warn(
-        "[cuda_engine] CUDA 13.x DLLs not found in standard locations. "
-        "Set CUDA_PATH or add CUDA bin/x64 to PATH.",
-        RuntimeWarning,
-        stacklevel=2,
-    )
+_dll_handles = []
+for _cuda_dir in _CUDA_SEARCH_PATHS:
+    if _cuda_dir and os.path.isdir(_cuda_dir):
+        if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+            try:
+                _dll_handles.append(os.add_dll_directory(_cuda_dir))
+            except Exception:
+                pass
+        if _cuda_dir not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = _cuda_dir + os.pathsep + os.environ.get("PATH", "")
 
 # ---------------------------------------------------------------------------
-# 2. Pre-load PyTorch DLLs (c10.dll, torch_cpu.dll, torch_cuda.dll etc.)
+# 2. Pre-load PyTorch Libraries
 # ---------------------------------------------------------------------------
 try:
     import torch as _torch
     _torch_lib = os.path.join(os.path.dirname(_torch.__file__), "lib")
     if os.path.isdir(_torch_lib):
-        for _dll in os.listdir(_torch_lib):
-            if _dll.endswith(".dll"):
-                try:
-                    ctypes.CDLL(os.path.join(_torch_lib, _dll))
-                except Exception:
-                    pass
+        if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+            try:
+                _dll_handles.append(os.add_dll_directory(_torch_lib))
+            except Exception:
+                pass
+        if _torch_lib not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = _torch_lib + os.pathsep + os.environ.get("PATH", "")
 except ImportError:
-    pass  # PyTorch not installed — bindings won't work but won't crash import
+    pass
 
 # ---------------------------------------------------------------------------
-# 3. Import the compiled .pyd extension
+# 3. Import the compiled native extension (.pyd / .so)
 # ---------------------------------------------------------------------------
 _here = os.path.dirname(os.path.abspath(__file__))
 if _here not in sys.path:
@@ -78,34 +65,38 @@ if _here not in sys.path:
 
 try:
     import native_cuda_engine as _eng  # type: ignore
-    # Re-export the module as `eng` for convenient use
     eng = _eng
-    # Also expose top-level symbols
-    init           = _eng.init
-    init_default   = _eng.init_default
-    warmup         = _eng.warmup
-    capture_graph  = _eng.capture_graph
-    replay         = _eng.replay
-    train_step     = _eng.train_step
-    benchmark      = _eng.benchmark
-    save_checkpoint = _eng.save_checkpoint
-    load_checkpoint = _eng.load_checkpoint
-    get_loss       = _eng.get_loss
-    memory_info    = _eng.memory_info
-    synchronize    = _eng.synchronize
-    is_graph_ready = _eng.is_graph_ready
+    init            = getattr(_eng, "init", None)
+    init_default    = getattr(_eng, "init_default", None)
+    warmup          = getattr(_eng, "warmup", None)
+    capture_graph   = getattr(_eng, "capture_graph", None)
+    replay          = getattr(_eng, "replay", None)
+    train_step      = getattr(_eng, "train_step", None)
+    benchmark       = getattr(_eng, "benchmark", None)
+    save_checkpoint = getattr(_eng, "save_checkpoint", None)
+    load_checkpoint = getattr(_eng, "load_checkpoint", None)
+    get_loss        = getattr(_eng, "get_loss", None)
+    memory_info     = getattr(_eng, "memory_info", None)
+    synchronize     = getattr(_eng, "synchronize", None)
+    is_graph_ready  = getattr(_eng, "is_graph_ready", None)
     _ENGINE_AVAILABLE = True
 
 except ImportError as _e:
     _ENGINE_AVAILABLE = False
     eng = None
-    import warnings
-    warnings.warn(
-        f"[cuda_engine] Native engine not available: {_e}\n"
-        "Run: cd jarvis_engine/cuda_engine && python setup.py build_ext --inplace",
-        RuntimeWarning,
-        stacklevel=2,
-    )
+    init = None
+    init_default = None
+    warmup = None
+    capture_graph = None
+    replay = None
+    train_step = None
+    benchmark = None
+    save_checkpoint = None
+    load_checkpoint = None
+    get_loss = None
+    memory_info = None
+    synchronize = None
+    is_graph_ready = None
 
 __all__ = [
     "eng",

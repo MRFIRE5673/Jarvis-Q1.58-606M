@@ -30,8 +30,8 @@
 | **Padded Vocabulary ($V_{\text{pad}}$)** | **50,304** | Padded for 64/128-element Tensor Core MMA alignment |
 | **Context Length ($T$)** | **512** tokens | Standard training sequence length |
 | **Normalization** | **RMSNorm** | Root Mean Square Layer Normalization ($\epsilon = 10^{-6}$) |
-| **Activation Function** | **GELU** | In-place Gaussian Error Linear Unit |
-| **Precision** | **BF16 / FP32** | BF16 weights/activations; FP32 optimizer moments |
+| **Activation Function** | **ELU+1 (Q/K), GELU (FFN)** | ELU+1 feature maps for queries and keys (Katharopoulos); GELU in expert FFNs |
+| **Precision** | **BF16 / FP32** | BF16 activations; FP32 master weights and optimizer moments |
 
 ---
 
@@ -167,15 +167,14 @@ The repository maintains two synchronized implementations:
 
 ---
 
-## 7. Canonical Production Training Setup
+## 7. Canonical Production Training Setup (Current Defaults)
 
-* **Micro-Batch Size ($B$):** 4 sequences
+* **Micro-Batch Size ($B$):** 8 sequences
 * **Sequence Length ($T$):** 512 tokens
-* **Gradient Accumulation ($accum$):** 4 microsteps per update
-* **Tokens per Optimizer Step:** $4 \times 512 \times 4 = \mathbf{8,192\text{ tokens/update}}$
+* **Gradient Accumulation ($accum$):** 2 microsteps per update
+* **Tokens per Optimizer Step:** $8 \times 512 \times 2 = \mathbf{8,192\text{ tokens/update}}$
 * **Optimizer:** AdamW, $\beta_1=0.9$, $\beta_2=0.999$, weight decay $=0.01$, gradient clip $=1.0$
-* **Learning Rate:** $3\times10^{-4}$ base LR, GPU-resident 3% linear warmup, cosine decay to 10% of base LR
-* **Sustained Latency:** **79.175 ms per update**
-* **Measured Full-Training Throughput:** **~16,100 tokens/sec** on RTX 5070 with `B=4, T=512, accum=4`; older 51k figures are from a non-comparable timing path.
-* **VRAM Footprint:** 1,166.07 MiB Allocated | 1,186.00 MiB Reserved
-* **Numerical Invariant:** Strict mathematical loss parity ($L_\infty = 0.0000000\text{e}+00$)
+* **Learning Rate:** $2\times10^{-5}$ base LR, GPU-resident 3% linear warmup, cosine decay
+* **Measured Throughput:** **17,000–20,000 tok/s** on RTX 5070 SM120 (sparse MoE mode, dynamic expert batches, CUDA Graphs disabled)
+* **Wall-clock estimate:** ~5.5–6.5 hours for a 400M-token run
+* **VRAM footprint:** approximately 8–10 GB allocated during training (sparse mode)

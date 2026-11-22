@@ -28,6 +28,12 @@
 // Convenience alias
 using bf16 = __nv_bfloat16;
 
+static constexpr int kLsfReduceBlocks = 128;
+static constexpr int kLsfAlphaStatsOffset = 2;
+static constexpr int kLsfAlphaSqOffset = kLsfAlphaStatsOffset + kLsfReduceBlocks;
+static constexpr int kLsfAlphaGradOffset = kLsfAlphaSqOffset + kLsfReduceBlocks;
+static constexpr int kLsfAlphaWorkspaceFloats = kLsfAlphaGradOffset + 1;
+
 // ---------------------------------------------------------------------------
 // Model configuration (values from architecture.md — do not change)
 // ---------------------------------------------------------------------------
@@ -57,6 +63,7 @@ struct JarvisConfig {
     float grad_clip    = 1.0f;
     int   warmup_steps = 100;
     int   decay_steps  = 10000;
+    int   lr_step_offset = 0;
     float min_lr_ratio = 0.1f;
 
     // ---- Aux losses ----
@@ -163,6 +170,9 @@ struct JarvisParams {
 struct JarvisWorkspace {
     // Inputs
     int*   token_ids    = nullptr;  // [NT] int32
+    unsigned char* target_mask = nullptr; // Optional response-only loss mask
+    bool use_target_mask = false;
+    int active_target_count = 0;
 
     // Activation pipeline
     bf16*  tok_emb_out  = nullptr;  // [NT, C]  after embedding lookup
@@ -196,7 +206,7 @@ struct JarvisWorkspace {
     bf16*  layer_h1     = nullptr;  // [NTK, hi]  expert W1 output (in-place GELU)
     bf16*  expert_out   = nullptr;  // [NTK, C]   expert W2 output
     bf16*  moe_out      = nullptr;  // [NT, C]   scatter-combined
-    float* lsf_alpha    = nullptr;  // [1] FP32 dynamic alpha per layer step
+    float* lsf_alpha    = nullptr;  // alpha, global mean, partial stats, and d_alpha scratch
     bf16*  lsf_h        = nullptr;  // [L, B, C]  persistent membrane states
     bf16*  lsf_out      = nullptr;  // [NT, C]   output of LSF
 

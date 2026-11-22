@@ -87,7 +87,12 @@ if cuda_home:
     if cuda_bin not in os.environ.get("PATH", ""):
         os.environ["PATH"] = cuda_bin + os.pathsep + os.environ.get("PATH", "")
     cuda_inc = os.path.join(cuda_home, "include")
-    cuda_lib = os.path.join(cuda_home, "lib", "x64" if sys.platform == "win32" else "")
+    if sys.platform == "win32":
+        cuda_lib = os.path.join(cuda_home, "lib", "x64")
+    else:
+        cuda_lib = os.path.join(cuda_home, "lib64")
+        if not os.path.exists(cuda_lib):
+            cuda_lib = os.path.join(cuda_home, "lib")
     print(f"[setup.py] CUDA_HOME: {cuda_home}")
 else:
     cuda_inc = ""
@@ -110,10 +115,34 @@ if os.environ.get("JARVIS_ALLOW_CUDA_MISMATCH") == "1":
 # 3. NVCC FLAGS — SM120 Blackwell exclusive
 # No fallback fatbins (sm_80, sm_90, etc.) — 100% native SM120 ISA.
 # =============================================================================
-nvcc_flags = [
-    # SM120 Blackwell — only binary target
-    "-gencode=arch=compute_120,code=sm_120",
+# Architecture detection: Auto-detect connected GPU or allow manual override
+target_archs = []
+env_arch = os.environ.get("JARVIS_CUDA_ARCH") or os.environ.get("TORCH_CUDA_ARCH_LIST")
+if env_arch:
+    for arch in env_arch.replace(";", " ").split():
+        arch_clean = arch.strip().replace(".", "")
+        if arch_clean:
+            target_archs.append(f"-gencode=arch=compute_{arch_clean},code=sm_{arch_clean}")
+elif torch.cuda.is_available():
+    try:
+        cap = torch.cuda.get_device_capability()
+        arch_code = f"{cap[0]}{cap[1]}"
+        target_archs.append(f"-gencode=arch=compute_{arch_code},code=sm_{arch_code}")
+        print(f"[setup.py] Auto-detected GPU architecture: sm_{arch_code}")
+    except Exception:
+        pass
 
+if not target_archs:
+    # Default to SM120 (Blackwell RTX 5070) with common fallback archs
+    target_archs = [
+        "-gencode=arch=compute_80,code=sm_80",
+        "-gencode=arch=compute_86,code=sm_86",
+        "-gencode=arch=compute_89,code=sm_89",
+        "-gencode=arch=compute_90,code=sm_90",
+        "-gencode=arch=compute_120,code=sm_120",
+    ]
+
+nvcc_flags = target_archs + [
     # Optimization
     "-O3",
     "--use_fast_math",
@@ -194,6 +223,7 @@ sources = [
     "backward.cu",         # Grad accumulation, router backward
     "core_kernels.cu",     # RMSNorm fwd/bwd, linear attn fwd/bwd, MoE combine
     "full_engine.cu",      # 24-layer orchestration + CUDA Graph
+    "decode.cu",           # Native single-token decode & autoregressive generation
 ]
 
 # =============================================================================

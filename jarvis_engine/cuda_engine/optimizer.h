@@ -22,7 +22,7 @@ void launch_prepare_optimizer_step(
     float*       d_lr,
     const float* d_grad_norm_sq,
     float beta1, float beta2, float grad_clip, float base_lr,
-    int warmup_steps, int decay_steps, float min_lr_ratio,
+    int warmup_steps, int decay_steps, float min_lr_ratio, int lr_step_offset,
     cudaStream_t s
 );
 

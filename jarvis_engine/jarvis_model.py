@@ -13,7 +13,10 @@ Bugs fixed vs. original:
 """
 import os, sys, glob, math, torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_ckpt
-from utils.ternary_ops import TernaryLinear, FusedQKVSTE, FusedQKVLinear
+try:
+    from jarvis_engine.utils.ternary_ops import TernaryLinear, FusedQKVSTE, FusedQKVLinear
+except ImportError:
+    from utils.ternary_ops import TernaryLinear, FusedQKVSTE, FusedQKVLinear
 
 
 try:
@@ -320,8 +323,42 @@ class AssociativeLinearAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Bug 2 FIX: Gaussian noise added to router logits (Algo 1 L11)
-# Bug 3 FIX: Load-balance loss uses f_i * P_i (Eq. 6), not P_i^2
+# Straight-Through Top-K Estimator (from author's friend's implementation)
+# Forward: hard binary top-K mask
+# Backward: straight-through — gradient passes only through selected experts
+# ---------------------------------------------------------------------------
+class _STETopK(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, scores: torch.Tensor, K: int) -> torch.Tensor:  # type: ignore[override]
+        ctx.save_for_backward(scores)
+        ctx.K = K
+        _, idx = torch.topk(scores, K, dim=-1)
+        mask = torch.zeros_like(scores, dtype=torch.bool)
+        mask.scatter_(1, idx, True)
+        return mask.float()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
+        (scores,) = ctx.saved_tensors
+        _, idx = torch.topk(scores, ctx.K, dim=-1)
+        mask = torch.zeros_like(scores, dtype=torch.bool)
+        mask.scatter_(1, idx, True)
+        return grad_output * mask.float(), None
+
+
+# ---------------------------------------------------------------------------
+# SparseMoELayer — upgraded with friend's STE router + Gumbel noise
+#
+# Key improvements over prior Gaussian-noise softmax router:
+#   1. Gumbel noise instead of Gaussian — theoretically cleaner (Gumbel-max
+#      trick makes the argmax differentiable in expectation), matches what the
+#      CUDA engine already does via its Box-Muller per-layer seeded noise.
+#   2. Straight-Through Top-K estimator — hard selection in forward, true
+#      gradient only through selected expert paths in backward (not softmax-
+#      smoothed allocation). Removes the "ghost gradient" problem where
+#      non-selected experts receive gradient through the softmax.
+#   3. Load-balance loss uses both dispatch fraction f_i AND mean prob P_i
+#      (unchanged from before — already matched Eq. 6).
 # ---------------------------------------------------------------------------
 class SparseMoELayer(nn.Module):
     def __init__(self, d_model, num_experts=4, top_k=2, hidden_mult=2,
@@ -329,51 +366,62 @@ class SparseMoELayer(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
-        self.noise_std = noise_std        # σ for Gaussian routing noise
-        self.balance_alpha = balance_alpha  # α in Eq. 6
-        self.router = nn.Linear(d_model, num_experts, bias=False)
+        self.balance_alpha = balance_alpha
+        # Learned expert centroid embeddings (friend's design: dot-product routing)
+        # Replaces nn.Linear router — no bias, init matches friend's ±0.1 uniform
+        self.expert_emb = nn.Parameter(
+            torch.empty(num_experts, d_model).uniform_(-0.1, 0.1)
+        )
         hidden = d_model * hidden_mult
-        # Paper Section 3.2: ALL Feed-Forward pathways are ternary
         self.w1 = nn.ModuleList([TernaryLinear(d_model, hidden) for _ in range(num_experts)])
         self.w2 = nn.ModuleList([TernaryLinear(hidden, d_model) for _ in range(num_experts)])
 
-    def forward(self, x):
+    @staticmethod
+    def _gumbel(shape: torch.Size, device: torch.device) -> torch.Tensor:
+        u = torch.rand(shape, device=device).clamp(min=1e-10)
+        return -torch.log(-torch.log(u))
+
+    def forward(self, x: torch.Tensor):
         B, T, C = x.shape
         N = B * T
         x_flat = x.view(N, C)
 
-        # Router logits + Gaussian noise (Algo 1 L11: G(A_spike) + N(0, σ²))
-        logits = self.router(x_flat)  # (N, E)
+        # Router scores: dot product between token and expert embeddings (N, E)
+        scores = x_flat @ self.expert_emb.t()
+
+        # Gumbel noise during training — breaks symmetry without biasing probs
         if self.training:
-            logits = logits + torch.randn_like(logits) * self.noise_std
+            scores = scores + self._gumbel(scores.shape, scores.device)
 
-        probs = F.softmax(logits, dim=-1)                        # (N, E)
-        topk_probs, topk_idx = probs.topk(self.top_k, dim=-1)   # (N, top_k)
-        topk_gates = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
+        # Soft probs for load-balance loss (need full distribution)
+        probs = F.softmax(scores, dim=-1)   # (N, E)
 
-        # Vectorized MoE: batched expert computation
-        # flat_idx/flat_gate: (N*top_k,)  flat_x: (N*top_k, C)
-        flat_idx  = topk_idx.reshape(-1)                         # (N*K,)
-        flat_gate = topk_gates.reshape(-1)                       # (N*K,)
-        flat_x    = x_flat.repeat_interleave(self.top_k, dim=0)  # (N*K, C)
-        flat_out  = torch.zeros_like(flat_x)                     # (N*K, C)
+        # Hard top-K mask with straight-through gradient
+        mask = _STETopK.apply(scores, self.top_k)              # (N, E) hard
+        masked_scores = scores.masked_fill(mask == 0, float("-inf"))
+        topk_gates_full = F.softmax(masked_scores, dim=-1) * mask  # (N, E) sparse
+        topk_gates_full = topk_gates_full / (topk_gates_full.sum(-1, keepdim=True) + 1e-9)
 
-        # Batch experts together using grouped GEMM-like pattern
-        # Each expert processes its assigned tokens in parallel
+        # Dispatch: gather selected expert indices and gate weights
+        topk_gates, topk_idx = topk_gates_full.topk(self.top_k, dim=-1)  # (N, K)
+
+        flat_idx  = topk_idx.reshape(-1)
+        flat_gate = topk_gates.reshape(-1)
+        flat_x    = x_flat.repeat_interleave(self.top_k, dim=0)
+        flat_out  = torch.zeros_like(flat_x)
+
         for e in range(self.num_experts):
-            mask = (flat_idx == e)
-            if mask.any():
-                xe = flat_x[mask]
-                ye = self.w2[e](F.gelu(self.w1[e](xe)))
-                flat_out[mask] = flat_gate[mask].unsqueeze(-1) * ye
+            m = flat_idx == e
+            if m.any():
+                xe = flat_x[m]
+                flat_out[m] = flat_gate[m].unsqueeze(-1) * self.w2[e](F.gelu(self.w1[e](xe)))
 
-        # Sum both top-k contributions per original token
         out = flat_out.view(N, self.top_k, C).sum(dim=1).view(B, T, C)
 
-        # Load-balance loss: α * N_experts * Σ f_i * P_i  (Eq. 6)
-        top1_idx = topk_idx[:, 0]
-        f = F.one_hot(top1_idx, num_classes=self.num_experts).float().mean(dim=0)
-        P = probs.mean(dim=0)
+        # Load-balance loss: α * E * Σ f_i * P_i  (Eq. 6)
+        # f_i = mean dispatch fraction, P_i = mean gate probability
+        f = mask.mean(dim=0)   # (E,) — mean fraction dispatched per expert
+        P = probs.mean(dim=0)  # (E,) — mean gate probability per expert
         l_balance = self.balance_alpha * self.num_experts * (f * P).sum()
 
         act_mean = out.mean()

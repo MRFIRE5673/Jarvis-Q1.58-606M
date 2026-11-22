@@ -1,5 +1,5 @@
 // =============================================================================
-// core_kernels.cu — correct forward/backward kernels for the training engine
+// core_kernels.cu ï¿½ correct forward/backward kernels for the training engine
 //   RMSNorm fwd/bwd, linear attention (true per-token decay) fwd/bwd,
 //   dense-expert MoE combine fwd/bwd, router bwd, embedding bwd, misc.
 // Activations are BF16 in [NT, ...] token-major layout; math is FP32.
@@ -109,7 +109,8 @@ __global__ void scan16_k(const bf16* A, int sA, const bf16* Bv, int sB, const bf
     int t32 = threadIdx.x;
     int u = ub * 8 + (t32 >> 2);
     int ws = (t32 & 3) * 16;
-    float g = expf(log_gamma[h]);
+    float raw_g = log_gamma[h];
+    float g = 1.0f / (1.0f + expf(-raw_g));
     
     // Use registers for X[16] - unrolled loop
     float X0=0, X1=0, X2=0, X3=0, X4=0, X5=0, X6=0, X7=0;
@@ -240,7 +241,7 @@ __global__ void moe_combine_fwd_k(const bf16* y, const bf16* x2, const int* idx,
     int e0 = idx[2 * t], e1 = idx[2 * t + 1];
     float g0 = gates[2 * t], g1 = gates[2 * t + 1];
     for (int i = threadIdx.x; i < C; i += blockDim.x) {
-        float v = bf2f(x2[(size_t)t * C + i])
+        float v = (x2 ? bf2f(x2[(size_t)t * C + i]) : 0.0f)
                 + g0 * bf2f(y[((size_t)e0 * NT + t) * C + i])
                 + g1 * bf2f(y[((size_t)e1 * NT + t) * C + i]);
         m[(size_t)t * C + i] = f2bf(v);

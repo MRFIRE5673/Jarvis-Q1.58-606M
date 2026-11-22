@@ -15,15 +15,24 @@ __device__ __forceinline__ float warp_sum(float v) {
 }
 
 // ===========================================================================
-// 1. TOP-2 GATING (E=4 — fully register-resident, no SMEM)
+// 1. TOP-2 GATING — Gumbel-STE (from author's friend's implementation)
 //    Grid: (NT/BLOCK,), Block: (BLOCK=256,)
-//    Each thread handles one token independently.
-//    E=4 logits fit in 4 registers — no shared memory needed.
+//    Each thread handles one token. E=4 fits in 4 registers — no SMEM.
+//
+//    Key change from prior softmax-first approach:
+//      OLD: softmax(logits + Gaussian) → top-2 on probs → normalize
+//      NEW: logits + Gumbel → top-2 on NOISED LOGITS (hard select)
+//           → masked softmax over selected 2 only → normalize
+//
+//    Why: Gumbel-max trick makes argmax(logit + Gumbel) ≡ categorical sample.
+//    STE: hard selection in forward, gradient flows only through selected
+//    experts in backward — no "ghost gradient" to unselected experts.
+//    probs[] still written as full-distribution softmax for load-balance loss.
 // ===========================================================================
 __global__ void top2_gating_kernel(
-    const __nv_bfloat16* __restrict__ logits,  // [NT, 4]
-    float*               __restrict__ probs,   // [NT, 4]
-    int*                 __restrict__ topk_idx,// [NT, 2]
+    const __nv_bfloat16* __restrict__ logits,    // [NT, 4]
+    float*               __restrict__ probs,     // [NT, 4]  full softmax — for load balance
+    int*                 __restrict__ topk_idx,  // [NT, 2]
     float*               __restrict__ topk_gates,// [NT, 2]
     int*                 __restrict__ expert_counts,
     int NT, float noise_std, const int* step, int noise_seed
@@ -32,50 +41,65 @@ __global__ void top2_gating_kernel(
     if (tok >= NT) return;
 
     int base = tok * 4;
-    float lg[4];
+    float raw[4];   // raw logits
+    float noised[4]; // logits + Gumbel noise (used for hard selection)
+
+    // ---- Load logits + compute Gumbel noise --------------------------------
+    unsigned step_seed = step ? (unsigned)(*step) : 0u;
     #pragma unroll
     for (int e = 0; e < 4; ++e) {
-        lg[e] = __bfloat162float(logits[base + e]);
+        raw[e] = __bfloat162float(logits[base + e]);
         if (noise_std > 0.0f) {
-            // Stateless Box-Muller noise keeps CUDA graph replay deterministic
-            // while matching the paper's N(0, sigma^2) router perturbation.
-            unsigned step_seed = step ? (unsigned)(*step) : 0u;
+            // Stateless Gumbel noise: -log(-log(u)), u ~ Uniform(0,1)
+            // Uses the same hash chain as before for CUDA-graph determinism.
             unsigned h = (unsigned)(tok * 0x9e3779b9u) ^
                          (unsigned)(e * 0x85ebca6bu) ^
                          (unsigned)(noise_seed * 0xc2b2ae35u) ^
                          (step_seed * 0x27d4eb2fu);
             h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15;
             unsigned h2 = h * 0x846ca68bu + 0xda3e39cbu;
-            float u1 = ((h & 0x00ffffffu) + 1.0f) * (1.0f / 16777217.0f);
-            float u2 = ((h2 & 0x00ffffffu) + 1.0f) * (1.0f / 16777217.0f);
-            lg[e] += noise_std * sqrtf(-2.0f * logf(u1)) * cosf(6.28318530718f * u2);
+            // Two independent uniform samples for Gumbel (only u1 needed, u2 spare)
+            float u1 = ((h  & 0x00ffffffu) + 1.0f) * (1.0f / 16777217.0f);
+            float g  = -logf(-logf(u1));  // Gumbel(0,1)
+            noised[e] = raw[e] + noise_std * g;
+        } else {
+            noised[e] = raw[e];
         }
     }
 
-    // Stable softmax over E=4
-    float mx = fmaxf(fmaxf(lg[0], lg[1]), fmaxf(lg[2], lg[3]));
+    // ---- Full softmax on raw logits → probs[] for load-balance loss --------
+    float mx = fmaxf(fmaxf(raw[0], raw[1]), fmaxf(raw[2], raw[3]));
     float s  = 0.0f;
+    float p[4];
     #pragma unroll
-    for (int e = 0; e < 4; ++e) { lg[e] = expf(lg[e] - mx); s += lg[e]; }
+    for (int e = 0; e < 4; ++e) { p[e] = expf(raw[e] - mx); s += p[e]; }
     float inv_s = 1.0f / (s + 1e-8f);
     #pragma unroll
-    for (int e = 0; e < 4; ++e) { lg[e] *= inv_s; probs[base + e] = lg[e]; }
+    for (int e = 0; e < 4; ++e) probs[base + e] = p[e] * inv_s;
 
-    // Top-2 selection (unrolled for E=4, no branches on sorted order)
+    // ---- STE top-2: select on NOISED logits (hard, no softmax) ------------
     int i0 = 0;
     #pragma unroll
-    for (int e = 1; e < 4; ++e) if (lg[e] > lg[i0]) i0 = e;
+    for (int e = 1; e < 4; ++e) if (noised[e] > noised[i0]) i0 = e;
 
     int i1 = (i0 == 0) ? 1 : 0;
     #pragma unroll
     for (int e = 0; e < 4; ++e)
-        if (e != i0 && lg[e] > lg[i1]) i1 = e;
+        if (e != i0 && noised[e] > noised[i1]) i1 = e;
 
-    // Normalize gate weights to sum=1 over selected top-2
-    float g_sum = lg[i0] + lg[i1] + 1e-8f;
+    // ---- Masked softmax over selected 2 only → dispatch gate weights -------
+    // Forward: hard gate weights from softmax restricted to {i0, i1}.
+    // Backward (STE): gradient flows only through i0 and i1 paths — the
+    // selection mask itself carries no gradient (straight-through).
+    float mx2  = fmaxf(raw[i0], raw[i1]);
+    float e0   = expf(raw[i0] - mx2);
+    float e1   = expf(raw[i1] - mx2);
+    float gsum = e0 + e1 + 1e-8f;
+
     topk_idx  [tok * 2 + 0] = i0;  topk_idx  [tok * 2 + 1] = i1;
-    topk_gates[tok * 2 + 0] = lg[i0] / g_sum;
-    topk_gates[tok * 2 + 1] = lg[i1] / g_sum;
+    topk_gates[tok * 2 + 0] = e0 / gsum;
+    topk_gates[tok * 2 + 1] = e1 / gsum;
+
     if (expert_counts) {
         atomicAdd(&expert_counts[i0], 1);
         atomicAdd(&expert_counts[i1], 1);
@@ -225,11 +249,13 @@ __global__ void sparse_combine_fwd_kernel(
     int vec = threadIdx.x;
     if (vec >= C / 8) return;
     int col = vec * 8;
-    const uint4* xr = reinterpret_cast<const uint4*>(x_residual + (size_t)tok * C + col);
-    const __nv_bfloat16* xrv = reinterpret_cast<const __nv_bfloat16*>(xr);
-    float v[8];
-    #pragma unroll
-    for (int j = 0; j < 8; ++j) v[j] = __bfloat162float(xrv[j]);
+    float v[8] = {};
+    if (x_residual) {
+        const uint4* xr = reinterpret_cast<const uint4*>(x_residual + (size_t)tok * C + col);
+        const __nv_bfloat16* xrv = reinterpret_cast<const __nv_bfloat16*>(xr);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = __bfloat162float(xrv[j]);
+    }
     for (int j = 0; j < 8; ++j) {
         for (int k = 0; k < K; ++k) {
             int e = topk_idx[tok * K + k];
@@ -300,7 +326,34 @@ void launch_sparse_combine_bwd(
     CUDA_CHECK_LAST();
 }
 
-// ===========================================================================
+__global__ void sparse_input_grad_combine_kernel(
+    const __nv_bfloat16* __restrict__ route_dx,
+    const int* __restrict__ topk_idx, const int* __restrict__ route_pos,
+    const int* __restrict__ offsets, __nv_bfloat16* __restrict__ dx,
+    int NT, int K, int C
+) {
+    int tok = blockIdx.x;
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            int flat = tok * K + k;
+            int e = topk_idx[flat];
+            int pos = route_pos[flat];
+            sum += __bfloat162float(route_dx[((size_t)offsets[e] + pos) * C + i]);
+        }
+        dx[(size_t)tok * C + i] = __float2bfloat16(sum);
+    }
+}
+
+void launch_sparse_input_grad_combine(
+    const __nv_bfloat16* route_dx, const int* topk_idx, const int* route_pos,
+    const int* offsets, __nv_bfloat16* dx, int NT, int K, int C, cudaStream_t s
+) {
+    sparse_input_grad_combine_kernel<<<NT, 256, 0, s>>>(
+        route_dx, topk_idx, route_pos, offsets, dx, NT, K, C);
+    CUDA_CHECK_LAST();
+}
+
 // 3a. IN-PLACE GELU FORWARD (vec8 uint4 — memory-bound)
 // ===========================================================================
 __global__ void gelu_fwd_vec8_kernel(__nv_bfloat16* x, int N8) {
@@ -478,7 +531,7 @@ void launch_scatter_combine(
 // ===========================================================================
 // 6. LOAD BALANCE LOSS
 //    L_bal = α_bal × E × Σ_i f_i × P_i
-//    f_i  = fraction of tokens whose top-1 is expert i
+//    f_i  = normalized fraction of top-2 assignments sent to expert i
 //    P_i  = mean gating probability for expert i
 //    Single block, 32 threads (one warp), E=4 — tiny kernel
 // ===========================================================================
@@ -486,15 +539,15 @@ __global__ void load_balance_kernel(
     const float* __restrict__ probs,    // [NT, E]
     const int*   __restrict__ topk_idx, // [NT, K]
     float*       __restrict__ l_balance,
-    float alpha_bal, int NT, int E
+    float alpha_bal, int NT, int E, bool accumulate
 ) {
     __shared__ float sf[4], sp[4];
     if (threadIdx.x < E) { sf[threadIdx.x] = 0.0f; sp[threadIdx.x] = 0.0f; }
     __syncthreads();
 
     for (int tok = threadIdx.x; tok < NT; tok += blockDim.x) {
-        int top1 = topk_idx[tok * 2];  // top-1 expert
-        atomicAdd(&sf[top1], 1.0f / (float)NT);
+        for (int k = 0; k < 2; ++k)
+            atomicAdd(&sf[topk_idx[tok * 2 + k]], 0.5f / (float)NT);
         for (int e = 0; e < E; ++e)
             atomicAdd(&sp[e], probs[tok * E + e] / (float)NT);
     }
@@ -503,7 +556,9 @@ __global__ void load_balance_kernel(
     if (threadIdx.x == 0) {
         float loss = 0.0f;
         for (int e = 0; e < E; ++e) loss += sf[e] * sp[e];
-        *l_balance = alpha_bal * (float)E * loss;
+        float value = alpha_bal * (float)E * loss;
+        if (accumulate) atomicAdd(l_balance, value);
+        else *l_balance = value;
     }
 }
 
@@ -512,6 +567,46 @@ void launch_load_balance_loss(
     float* l_balance,
     float alpha_bal, int NT, int E, cudaStream_t s
 ) {
-    load_balance_kernel<<<1, 32, 0, s>>>(probs, topk_idx, l_balance, alpha_bal, NT, E);
+    load_balance_kernel<<<1, 32, 0, s>>>(probs, topk_idx, l_balance, alpha_bal, NT, E, false);
+    CUDA_CHECK_LAST();
+}
+
+void launch_accumulate_load_balance_loss(
+    const float* probs, const int* topk_idx, float* l_balance,
+    float alpha_bal, int NT, int E, cudaStream_t s
+) {
+    load_balance_kernel<<<1, 32, 0, s>>>(probs, topk_idx, l_balance, alpha_bal, NT, E, true);
+    CUDA_CHECK_LAST();
+}
+
+__global__ void load_balance_grad_kernel(
+    const float* __restrict__ probs, const int* __restrict__ topk_idx,
+    __nv_bfloat16* __restrict__ dlogits, float alpha_bal, int NT, int E
+) {
+    __shared__ float fractions[4];
+    if (threadIdx.x < E) fractions[threadIdx.x] = 0.0f;
+    __syncthreads();
+    for (int tok = threadIdx.x; tok < NT; tok += blockDim.x) {
+        atomicAdd(&fractions[topk_idx[tok * 2]], 0.5f / (float)NT);
+        atomicAdd(&fractions[topk_idx[tok * 2 + 1]], 0.5f / (float)NT);
+    }
+    __syncthreads();
+    for (int tok = threadIdx.x; tok < NT; tok += blockDim.x) {
+        int base = tok * E;
+        float dot = 0.0f;
+        for (int e = 0; e < E; ++e) dot += fractions[e] * probs[base + e];
+        for (int e = 0; e < E; ++e) {
+            float p = probs[base + e];
+            float g = alpha_bal * (float)E / (float)NT * p * (fractions[e] - dot);
+            dlogits[base + e] = __float2bfloat16(__bfloat162float(dlogits[base + e]) + g);
+        }
+    }
+}
+
+void launch_load_balance_grad(
+    const float* probs, const int* topk_idx, __nv_bfloat16* dlogits,
+    float alpha_bal, int NT, int E, cudaStream_t s
+) {
+    load_balance_grad_kernel<<<1, 256, 0, s>>>(probs, topk_idx, dlogits, alpha_bal, NT, E);
     CUDA_CHECK_LAST();
 }

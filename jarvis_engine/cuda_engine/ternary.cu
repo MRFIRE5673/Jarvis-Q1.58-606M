@@ -108,6 +108,16 @@ void launch_ternary_quantize(const float* W_fp32, const float* alpha,
     CUDA_CHECK_LAST();
 }
 
+__global__ void paper_ternary_quantize_kernel(const float* W, __nv_bfloat16* Q, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) Q[i] = __float2bfloat16(roundf(fminf(1.0f, fmaxf(-1.0f, W[i]))));
+}
+
+void launch_paper_ternary_quantize(const float* W, __nv_bfloat16* Q, int N, cudaStream_t s) {
+    paper_ternary_quantize_kernel<<<(N + 255) / 256, 256, 0, s>>>(W, Q, N);
+    CUDA_CHECK_LAST();
+}
+
 // ---------------------------------------------------------------------------
 // 3. STE BACKWARD — SCALAR (simple comparison, not worth vectorizing)
 //    grad_W_fp32[i] = grad_W_q[i] × 1{|W_fp32[i]| ≤ 1.0}
@@ -150,6 +160,16 @@ __global__ void ternary_ste_mask_kernel(
 void launch_ternary_ste_mask(const float* W_fp32, const float* alpha,
                              __nv_bfloat16* grad_W_q, int N, cudaStream_t s) {
     ternary_ste_mask_kernel<<<(N + 255) / 256, 256, 0, s>>>(W_fp32, alpha, grad_W_q, N);
+    CUDA_CHECK_LAST();
+}
+
+__global__ void paper_ternary_ste_mask_kernel(const float* W, __nv_bfloat16* grad, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N && fabsf(W[i]) > 1.0f) grad[i] = __float2bfloat16(0.0f);
+}
+
+void launch_paper_ternary_ste_mask(const float* W, __nv_bfloat16* grad, int N, cudaStream_t s) {
+    paper_ternary_ste_mask_kernel<<<(N + 255) / 256, 256, 0, s>>>(W, grad, N);
     CUDA_CHECK_LAST();
 }
 

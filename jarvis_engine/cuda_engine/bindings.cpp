@@ -15,6 +15,7 @@
 
 #include "full_engine.h"
 #include "runtime.h"
+#include "decode.h"
 
 namespace py = pybind11;
 
@@ -40,7 +41,7 @@ static void py_init(
     float balance_alpha, float reflect_lambda,
     float lsf_alpha_min, float lsf_alpha_max,
     int device,
-    int warmup_steps, int decay_steps, float min_lr_ratio
+    int warmup_steps, int decay_steps, float min_lr_ratio, int lr_step_offset
 ) {
     JarvisConfig cfg;
     cfg.batch_size    = batch_size;
@@ -68,6 +69,7 @@ static void py_init(
     cfg.lsf_alpha_max = lsf_alpha_max;
     cfg.warmup_steps  = warmup_steps;
     cfg.decay_steps   = decay_steps;
+    cfg.lr_step_offset = lr_step_offset;
     cfg.min_lr_ratio  = min_lr_ratio;
     cfg.device        = device;
     get_engine().init(cfg, device);
@@ -93,6 +95,21 @@ static void py_replay() {
 
 static float py_train_step(const py::array_t<int>& token_ids) {
     return get_engine().train_step(int_ptr(token_ids));
+}
+
+static float py_train_step_masked(const py::array_t<int>& token_ids,
+                                  const py::array_t<unsigned char>& target_mask,
+                                  int active_targets) {
+    auto ids = token_ids.request();
+    auto mask = target_mask.request();
+    if (ids.ndim != 1 || mask.ndim != 1 || ids.size != mask.size)
+        throw py::value_error("token_ids and target_mask must be equal-length 1D arrays");
+    if (ids.strides[0] != (py::ssize_t)sizeof(int) ||
+        mask.strides[0] != (py::ssize_t)sizeof(unsigned char))
+        throw py::value_error("token_ids and target_mask must be contiguous");
+    return get_engine().train_step(
+        static_cast<const int*>(ids.ptr),
+        static_cast<const unsigned char*>(mask.ptr), active_targets);
 }
 
 static float py_benchmark(int n_steps = 100) {
@@ -244,13 +261,16 @@ Usage:
           py::arg("lsf_alpha_min")=0.1f, py::arg("lsf_alpha_max")=0.99f,
           py::arg("device")=0,
           py::arg("warmup_steps")=100, py::arg("decay_steps")=10000,
-          py::arg("min_lr_ratio")=0.1f);
+          py::arg("min_lr_ratio")=0.1f, py::arg("lr_step_offset")=0);
 
     m.def("init_default",   &py_init_default,  "Init with default Jarvis config", py::arg("device")=0);
     m.def("warmup",         &py_warmup,        "Warmup steps before graph capture", py::arg("n_steps")=3);
     m.def("capture_graph",  &py_capture_graph, "Capture CUDA Graph for zero-overhead replay");
     m.def("replay",         &py_replay,        "Replay captured CUDA Graph");
     m.def("train_step",     &py_train_step,    "Run one training step, return loss", py::arg("token_ids"));
+    m.def("train_step_masked", &py_train_step_masked,
+          "Run one response-masked training step", py::arg("token_ids"),
+          py::arg("target_mask"), py::arg("active_targets"));
     m.def("benchmark",      &py_benchmark,     "Benchmark N replays, return tok/s", py::arg("n_steps")=100);
     m.def("profile_step",   &py_profile_step,  "Profile fwd/bwd/opt timing breakdown",
           py::arg("token_ids"), py::arg("n_reps")=5);
@@ -263,4 +283,26 @@ Usage:
     m.def("destroy",        &py_destroy,       "Destroy engine and free GPU memory");
     m.def("memory_info",    &py_memory_info,   "Return {free_mb, total_mb, used_mb}");
     m.def("is_graph_ready", &py_graph_ready,   "True if CUDA Graph is captured and ready");
+    m.def("init_decode",    &init_decode_engine, "Initialize decode buffers and state");
+    m.def("reset_decode_state", &reset_decode_state, "Reset decode recurrent states (S and H)");
+    m.def("decode_step",    &decode_step_native,
+          "Run single token decode step",
+          py::arg("input_tok"), py::arg("pos"),
+          py::arg("temperature") = 0.7f, py::arg("top_p") = 0.9f, py::arg("top_k") = 50,
+          py::arg("rep_penalty") = 1.15f, py::arg("update_recent") = true);
+    m.def("generate", [](const std::vector<int>& prompt, int max_new_tokens, float temperature, float top_p, int top_k, py::object callback, float rep_penalty) {
+        std::function<void(int)> cb = nullptr;
+        if (!callback.is_none()) {
+            cb = [callback](int tok) {
+                py::gil_scoped_acquire acquire;
+                callback(tok);
+            };
+        }
+        py::gil_scoped_release release;
+        return generate_native(prompt, max_new_tokens, temperature, top_p, top_k, cb, rep_penalty);
+    }, "Native C++ autoregressive generator",
+       py::arg("prompt"), py::arg("max_new_tokens") = 128,
+       py::arg("temperature") = 0.7f, py::arg("top_p") = 0.9f, py::arg("top_k") = 50,
+       py::arg("callback") = py::none(),
+       py::arg("rep_penalty") = 1.15f);
 }

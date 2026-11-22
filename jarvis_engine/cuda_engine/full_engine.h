@@ -26,7 +26,8 @@ struct JarvisEngine {
     void warmup(int n_steps = 3);
     void capture_graph();
     void replay();
-    float train_step(const int* token_ids);
+    float train_step(const int* token_ids, const unsigned char* target_mask = nullptr,
+                     int active_targets = 0);
     float benchmark(int n_steps = 100);
     // Returns {fwd_ms, bwd_ms, opt_ms} (averaged over n_reps GPU-timed steps)
     void  profile_step(const int* token_ids, int n_reps,

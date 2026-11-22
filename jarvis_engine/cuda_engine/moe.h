@@ -61,6 +61,11 @@ void launch_sparse_combine_fwd(
     int NT, int K, int C, cudaStream_t s
 );
 
+void launch_sparse_input_grad_combine(
+    const __nv_bfloat16* route_dx, const int* topk_idx, const int* route_pos,
+    const int* offsets, __nv_bfloat16* dx, int NT, int K, int C, cudaStream_t s
+);
+
 void launch_sparse_combine_bwd(
     const __nv_bfloat16* dm, const __nv_bfloat16* expert_out,
     const int* topk_idx, const int* route_pos, const int* offsets, const float* topk_gates,
@@ -103,5 +108,15 @@ void launch_scatter_combine(
 void launch_load_balance_loss(
     const float* probs, const int* topk_idx,
     float* l_balance,
+    float alpha_bal, int NT, int E, cudaStream_t s
+);
+
+void launch_accumulate_load_balance_loss(
+    const float* probs, const int* topk_idx, float* l_balance,
+    float alpha_bal, int NT, int E, cudaStream_t s
+);
+
+void launch_load_balance_grad(
+    const float* probs, const int* topk_idx, __nv_bfloat16* dlogits,
     float alpha_bal, int NT, int E, cudaStream_t s
 );

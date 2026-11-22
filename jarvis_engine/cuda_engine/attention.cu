@@ -215,7 +215,8 @@ __global__ void assoc_attn_fwd_kernel(
     if (bh >= B * H) return;
 
     int d = threadIdx.x;  // ∈ [0, D)
-    float log_g = log_gamma[h];
+    float raw_g = log_gamma[h];
+    float log_g = -logf(1.0f + expf(-raw_g));
 
     // SMEM layout: S[D*D] FP32 + q_smem[D] FP32
     // Total: D*D*4 + D*4 = 64*64*4 + 64*4 = 16640 bytes < 48 KB

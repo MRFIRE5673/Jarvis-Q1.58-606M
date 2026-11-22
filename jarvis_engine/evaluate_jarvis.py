@@ -17,6 +17,7 @@ import math
 import time
 import argparse
 import statistics
+import contextlib
 import torch
 import torch.nn.functional as F
 
@@ -39,6 +40,46 @@ for p in [WORKSPACE_ROOT, JARVIS_ENGINE_PATH, SPARSE_DIR, ATTN_DIR]:
 
 from jarvis_model import Jarvis
 from tokenizer import ENCODING, StreamingDecoder
+
+
+def resolve_device(device_arg="auto"):
+    """Resolves target execution device (cuda, cpu, mps, or auto-detect)."""
+    if device_arg and device_arg != "auto":
+        return device_arg
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def get_device_name(device):
+    if device == "cuda" and torch.cuda.is_available():
+        return torch.cuda.get_device_name(0)
+    elif device == "mps":
+        return "Apple Silicon (MPS)"
+    return "CPU"
+
+
+def get_autocast(device):
+    if device == "cuda" and torch.cuda.is_available():
+        return torch.amp.autocast('cuda', dtype=torch.bfloat16)
+    elif device == "cpu":
+        try:
+            return torch.amp.autocast('cpu', dtype=torch.bfloat16)
+        except Exception:
+            return contextlib.nullcontext()
+    return contextlib.nullcontext()
+
+
+def sync_device(device):
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def empty_device_cache(device):
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def resolve_path(path_arg, default_name=None):
@@ -79,6 +120,8 @@ def parse_args():
                         help="Nucleus top-p filtering threshold (default: 0.9, 1.0 to disable)")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Path to model checkpoint (optional)")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu", "mps"],
+                        help="Execution device: auto, cuda, cpu, or mps (default: auto)")
 
     # Quantitative corpus evaluation arguments
     parser.add_argument("--eval-file", type=str, default="fresh_holdout.txt",
@@ -136,10 +179,8 @@ def load_binary_ckpt(resolved_ckpt, model, device="cuda"):
             b = model.blocks[l]
             b.norm1.weight.data.copy_(norm1.to(device=device, dtype=b.norm1.weight.dtype))
             b.norm2.weight.data.copy_(norm2.to(device=device, dtype=b.norm2.weight.dtype))
-            # The native engine stores log(gamma); the PyTorch recurrence stores logit(gamma).
-            decay = gamma.float().exp().clamp_(1e-6, 1.0 - 1e-6)
-            gamma_logit = torch.logit(decay)
-            b.attn.gamma_raw.data.copy_(gamma_logit.to(device=device, dtype=b.attn.gamma_raw.dtype))
+            # Native engine stores raw unconstrained logits directly, matching PyTorch gamma_raw
+            b.attn.gamma_raw.data.copy_(gamma.to(device=device, dtype=b.attn.gamma_raw.dtype))
             if hasattr(b.attn, "q_proj"):
                 b.attn.q_proj.weight.data.copy_(qkv[:C].to(device=device, dtype=b.attn.q_proj.weight.dtype))
                 b.attn.k_proj.weight.data.copy_(qkv[C:2*C].to(device=device, dtype=b.attn.k_proj.weight.dtype))
@@ -159,15 +200,16 @@ def load_binary_ckpt(resolved_ckpt, model, device="cuda"):
                 b.moe.w2[e]._native_prequantized = True
             b.moe._native_prequantized = True
 
-        rem = f.read()
+        rem = f.read(L * E * C * 4)
         if len(rem) >= L * E * C * 4:
-            r_data = np.frombuffer(rem[:L * E * C * 4], dtype=np.float32).copy().reshape((L, E, C))
+            r_data = np.frombuffer(rem, dtype=np.float32).copy().reshape((L, E, C))
             for l in range(L):
                 model.blocks[l].moe.router.weight.data.copy_(torch.from_numpy(r_data[l]).to(device=device, dtype=model.blocks[l].moe.router.weight.dtype))
     return step
 
 
-def load_jarvis_model(ckpt_path=None, device="cuda"):
+def load_jarvis_model(ckpt_path=None, device="auto"):
+    device = resolve_device(device)
     resolved_ckpt = None
     if ckpt_path and os.path.exists(ckpt_path):
         resolved_ckpt = os.path.abspath(ckpt_path)
@@ -190,8 +232,8 @@ def load_jarvis_model(ckpt_path=None, device="cuda"):
         num_experts=4,
         top_k=2,
         max_seq_len=256,
-        use_cuda_attn=True,
-        use_cuda_moe=True
+        use_cuda_attn=(device == "cuda"),
+        use_cuda_moe=(device == "cuda")
     ).to(device)
 
     n_params, param_str = model.param_count()
@@ -218,27 +260,28 @@ def load_jarvis_model(ckpt_path=None, device="cuda"):
         trained_step = 0
         resolved_ckpt = "None (untrained / fresh weights)"
         print("[Notice] No checkpoint found. Model initialized with random weights.")
-        print("         To train the model on tokens, use Train / resume in start.bat.")
+        print("         To train the model on tokens, use Train / resume in start.bat / start.sh.")
 
     status = model.get_backend_status()
-    device_name = torch.cuda.get_device_name(0) if device == "cuda" else "CPU"
+    device_name = get_device_name(device)
     print(f"Attention Backend:  {status['attn_backend'].upper()} ({status['attn_cuda_blocks']} blocks)")
     print(f"MoE Backend:        {status['moe_backend'].upper()} ({status['moe_cuda_blocks']} blocks)")
     print(f"Inference Device:   {device} ({device_name})")
     print(f"Inference Dtype:    torch.bfloat16 (with native FP32 accumulations)")
     print("=" * 80 + "\n")
 
-    torch.cuda.empty_cache()
+    empty_device_cache(device)
     model.eval()
     return model, resolved_ckpt, trained_step
 
 
-def print_model_info(model, ckpt_path, device="cuda"):
+def print_model_info(model, ckpt_path, device="auto"):
+    device = resolve_device(device)
     status = model.get_backend_status()
     n_params, param_str = model.param_count()
-    device_name = torch.cuda.get_device_name(0) if device == "cuda" else "CPU"
-    vram_alloc = torch.cuda.memory_allocated() / (1024 ** 3) if device == "cuda" else 0.0
-    vram_res = torch.cuda.memory_reserved() / (1024 ** 3) if device == "cuda" else 0.0
+    device_name = get_device_name(device)
+    vram_alloc = (torch.cuda.memory_allocated() / (1024 ** 3)) if (device == "cuda" and torch.cuda.is_available()) else 0.0
+    vram_res = (torch.cuda.memory_reserved() / (1024 ** 3)) if (device == "cuda" and torch.cuda.is_available()) else 0.0
 
     print("\n--- Model & System Information ---")
     print(f"Checkpoint:          {ckpt_path}")
@@ -252,20 +295,57 @@ def print_model_info(model, ckpt_path, device="cuda"):
     print("----------------------------------\n")
 
 
-def sample_next_token(logits, temperature=0.7, top_k=50, top_p=0.9, repetition_penalty=1.15, prev_tokens=None):
-    """Samples next token with temperature, top-k, and nucleus top-p filtering."""
-    if prev_tokens is not None and repetition_penalty > 1.0:
-        recent = sorted({t for t in prev_tokens[-256:] if 0 <= t < logits.size(-1)})
-        if recent:
-            ids = torch.tensor(recent, device=logits.device, dtype=torch.long)
-            values = logits.index_select(-1, ids)
-            values = torch.where(values > 0, values / repetition_penalty, values * repetition_penalty)
-            logits = logits.scatter(-1, ids.expand(logits.size(0), -1), values)
+def sample_next_token(
+    logits,
+    temperature=0.7,
+    top_k=50,
+    top_p=0.9,
+    repetition_penalty=1.15,
+    prev_tokens=None,
+    no_repeat_ngram_size=3
+):
+    """
+    Samples next token with advanced anti-gibberish / anti-looping protections:
+    1. N-gram repetition blocking (eliminates repeating 3-grams)
+    2. Frequency-weighted exponential repetition penalty
+    3. Consecutive single-token stutter suppression
+    4. Temperature scaling
+    5. Top-k and top-p nucleus sampling
+    """
+    logits = logits.clone().float()
+
+    if prev_tokens is not None and len(prev_tokens) > 0:
+        # 1. N-gram repetition blocking
+        if no_repeat_ngram_size > 0 and len(prev_tokens) >= no_repeat_ngram_size:
+            ngram_prefix = tuple(prev_tokens[-(no_repeat_ngram_size - 1):])
+            banned_tokens = set()
+            for idx in range(len(prev_tokens) - no_repeat_ngram_size + 1):
+                if tuple(prev_tokens[idx : idx + no_repeat_ngram_size - 1]) == ngram_prefix:
+                    banned_tokens.add(prev_tokens[idx + no_repeat_ngram_size - 1])
+            if banned_tokens:
+                banned_idx = [t for t in banned_tokens if 0 <= t < logits.size(-1)]
+                if banned_idx:
+                    logits[..., banned_idx] = -float("inf")
+
+        # 2. Frequency-weighted repetition penalty
+        if repetition_penalty > 1.0:
+            from collections import Counter
+            recent_counts = Counter(prev_tokens[-256:])
+            for tok, count in recent_counts.items():
+                if 0 <= tok < logits.size(-1):
+                    penalty = repetition_penalty ** min(count, 4)
+                    val = logits[..., tok]
+                    logits[..., tok] = torch.where(val > 0, val / penalty, val * penalty)
+
+            # 3. Consecutive repeat dampening (prevents whitespace/token stutter loops)
+            last_tok = prev_tokens[-1]
+            if 0 <= last_tok < logits.size(-1):
+                logits[..., last_tok] -= 2.0
 
     if temperature is None or temperature <= 0.0:
         return torch.argmax(logits, dim=-1, keepdim=True)
 
-    logits = logits.float() / max(temperature, 1e-5)
+    logits = logits / max(temperature, 1e-5)
     if top_k is not None and top_k > 0:
         candidate_logits, candidate_ids = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1, sorted=True)
     else:
@@ -285,6 +365,30 @@ def sample_next_token(logits, temperature=0.7, top_k=50, top_p=0.9, repetition_p
     return candidate_ids.gather(-1, selected)
 
 
+_NATIVE_ENGINE = None
+
+def get_native_engine(ckpt_path=None):
+    """Initializes and returns the singleton native CUDA C++ inference engine."""
+    global _NATIVE_ENGINE
+    if _NATIVE_ENGINE is not None:
+        return _NATIVE_ENGINE
+    try:
+        from jarvis_engine.cuda_engine import eng
+        eng.init(
+            1, 512, 1024, 16, 24, 4, 2, 2048, 50257, 50304, 64, 1,
+            1e-4, 0.9, 0.999, 1e-8, 0.01, 1.0, 0.01, 0.01, 0.1, 0.99, 0
+        )
+        resolved = ckpt_path
+        if not resolved or not os.path.exists(resolved):
+            resolved = resolve_path("data/jarvis_cuda.ckpt")
+        if resolved and os.path.exists(resolved) and resolved.endswith(".ckpt"):
+            eng.load_checkpoint(resolved)
+        _NATIVE_ENGINE = eng
+        return _NATIVE_ENGINE
+    except Exception as e:
+        return None
+
+
 @torch.inference_mode()
 def generate_streaming(
     model,
@@ -295,17 +399,62 @@ def generate_streaming(
     top_k: int = 50,
     top_p: float = 0.9,
     repetition_penalty: float = 1.15,
-    device: str = "cuda"
+    device: str = "auto",
+    ckpt_path: str = None
 ):
     """
-    O(1) per-token streaming inference using associative state caching.
-
-    Phase 5 implementation:
-      1. Reset all recurrent states (H and S).
-      2. Prefill the prompt context in one parallel forward pass (persist_state=True).
-      3. Autoregressively generate one token at a time — each step feeds only the
-         single new token and carries S_t and H_t forward. No sliding-window recompute.
+    O(1) per-token streaming inference.
+    Fast path: Native C++/CUDA Engine (100+ tok/s).
+    Fallback path: PyTorch associative state caching.
     """
+    device = resolve_device(device)
+    # 1. Try ultra-fast Native C++/CUDA Engine
+    if device == "cuda" and torch.cuda.is_available():
+        native_eng = get_native_engine(ckpt_path)
+        if native_eng is not None:
+            prompt_ids = enc.encode_ordinary(prompt_text)
+            if not prompt_ids:
+                prompt_ids = [enc.eot_token]
+
+            decoder = StreamingDecoder(enc)
+            decoded_parts = []
+
+            def stream_cb(tok_id):
+                chunk = decoder.push(tok_id)
+                decoded_parts.append(chunk)
+                if chunk:
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+
+            sync_device(device)
+            t_start = time.perf_counter()
+            tokens = native_eng.generate(prompt_ids, max_new_tokens, temperature, top_p, top_k, stream_cb)
+            sync_device(device)
+            t_end = time.perf_counter()
+
+            tail = decoder.finish()
+            decoded_parts.append(tail)
+            sys.stdout.write(tail + "\n")
+            sys.stdout.flush()
+
+            duration = t_end - t_start
+            n_tokens = len(tokens)
+            tok_s = n_tokens / max(duration, 1e-5)
+            peak_vram = (torch.cuda.max_memory_allocated() / (1024 ** 3)) if torch.cuda.is_available() else 0.0
+
+            print("-" * 50)
+            print(f"Tokens Generated:  {n_tokens}")
+            print(f"Generation Time:   {duration:.3f} s")
+            print(f"Throughput:        {tok_s:.1f} tok/s  [Native C++/CUDA Engine]")
+
+            return "".join(decoded_parts), {
+                "tokens_generated": n_tokens,
+                "generation_time_s": duration,
+                "tokens_per_sec": tok_s,
+                "peak_vram_gb": peak_vram,
+            }
+
+    # 2. Fallback PyTorch Path
     model.eval()
     model.reset_state()
 
@@ -315,7 +464,7 @@ def generate_streaming(
 
     # --- Prefill: process full prompt in one shot, cache recurrent state ---
     context = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
-    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+    with get_autocast(device):
         logits, _ = model(context, persist_state=True)
     # seed: last token of prompt gives first generation logit
     next_logits = logits[:, -1, :].float()
@@ -326,13 +475,16 @@ def generate_streaming(
     decoder = StreamingDecoder(enc)
     decoded_parts = []
 
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
+    sync_device(device)
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     t_start = time.perf_counter()
 
     for step_idx in range(max_new_tokens):
         tok_id = next_tok.item()
         if tok_id == enc.eot_token:
+            if step_idx == 0:
+                print("[Note: Model immediately emitted EOT — try a different prompt or check checkpoint.]", flush=True)
             break
 
         generated_token_ids.append(tok_id)
@@ -345,14 +497,14 @@ def generate_streaming(
             sys.stdout.flush()
 
         # O(1) single-token forward: feeds only the new token, S_t and H_t carried
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        with get_autocast(device):
             logits, _ = model(next_tok, persist_state=True)
         next_logits = logits[:, -1, :].float()
         seen = prompt_ids + generated_token_ids
         next_tok = sample_next_token(next_logits, temperature=temperature, top_k=top_k, top_p=top_p,
                                      repetition_penalty=repetition_penalty, prev_tokens=seen)
 
-    torch.cuda.synchronize()
+    sync_device(device)
     t_end = time.perf_counter()
 
     tail = decoder.finish()
@@ -363,7 +515,7 @@ def generate_streaming(
     duration = t_end - t_start
     n_tokens = len(generated_token_ids)
     tok_s = n_tokens / max(duration, 1e-5)
-    peak_vram = torch.cuda.max_memory_allocated() / (1024 ** 3) if device == "cuda" else 0.0
+    peak_vram = (torch.cuda.max_memory_allocated() / (1024 ** 3)) if (device == "cuda" and torch.cuda.is_available()) else 0.0
 
     stats = {
         "tokens_generated": n_tokens,
@@ -376,7 +528,8 @@ def generate_streaming(
     print(f"Tokens Generated:  {n_tokens}")
     print(f"Generation Time:   {duration:.3f} s")
     print(f"Throughput:        {tok_s:.1f} tok/s  [Phase 5: O(1) state cache]")
-    print(f"Peak VRAM:         {peak_vram:.2f} GB")
+    if device == "cuda" and torch.cuda.is_available():
+        print(f"Peak VRAM:         {peak_vram:.2f} GB")
     print("-" * 50)
 
     # Clean model state after response completion
@@ -384,8 +537,9 @@ def generate_streaming(
     return "".join(decoded_parts), stats
 
 
-def interactive_terminal(model, enc, args, ckpt_path, device="cuda"):
+def interactive_terminal(model, enc, args, ckpt_path, device="auto"):
     """Interactive CMD/Terminal REPL loop."""
+    device = resolve_device(device)
     print("================================================================================")
     print("                   JARVIS 606M INTERACTIVE TERMINAL                             ")
     print("================================================================================")
@@ -428,12 +582,14 @@ def interactive_terminal(model, enc, args, ckpt_path, device="cuda"):
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
-            device=device
+            device=device,
+            ckpt_path=ckpt_path
         )
 
 
 @torch.no_grad()
-def evaluate_corpus(model, file_path, enc, num_windows=200, seq_len=256, seed=42, label="HOLDOUT", device="cuda"):
+def evaluate_corpus(model, file_path, enc, num_windows=200, seq_len=256, seed=42, label="HOLDOUT", device="auto"):
+    device = resolve_device(device)
     resolved_file = resolve_path(file_path)
     if not os.path.exists(resolved_file):
         raise FileNotFoundError(f"CRITICAL ERROR: {label} file '{file_path}' does not exist! "
@@ -463,7 +619,7 @@ def evaluate_corpus(model, file_path, enc, num_windows=200, seq_len=256, seed=42
         x = tokens[start_idx : start_idx + seq_len].unsqueeze(0)
         y = tokens[start_idx + 1 : start_idx + seq_len + 1].unsqueeze(0)
 
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        with get_autocast(device):
             logits, loss = model(x, targets=y, persist_state=False)
 
         val = loss.item()
@@ -493,7 +649,7 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     enc = ENCODING
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = resolve_device(args.device)
 
     # 1. Load production model
     model, ckpt_path, trained_step = load_jarvis_model(args.ckpt, device=device)
@@ -515,12 +671,26 @@ def main():
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
-            device=device
+            device=device,
+            ckpt_path=ckpt_path
         )
         return
 
-    # 4. Standard Corpus Evaluation Mode
-    eval_file_resolved = resolve_path(args.eval_file, "fresh_holdout.txt")
+    eval_candidates = [
+        args.eval_file,
+        "fresh_holdout.txt",
+        "assistant_sft_tokens_holdout.txt",
+        "code_instruction_sft_tokens_holdout.txt",
+    ]
+    eval_file_resolved = None
+    for cand in eval_candidates:
+        if cand:
+            r = resolve_path(cand)
+            if r and os.path.exists(r):
+                eval_file_resolved = r
+                break
+    if not eval_file_resolved:
+        eval_file_resolved = resolve_path("fresh_holdout.txt")
     train_file_resolved = resolve_path(args.train_file, "data.txt")
 
     print("=" * 90)

@@ -234,27 +234,80 @@ def execute_tool(tool_name: str, arg: str) -> str:
 # ---------------------------------------------------------------------------
 
 class JarvisAgent:
-    def __init__(self, model, enc, device="cuda"):
+    def __init__(self, model, enc, device="auto"):
         self.model = model
         self.enc = enc
-        self.device = device
+        self.device = resolve_device(device)
         self.auto_execute = False
 
+    def format_prompt(self, prompt: str) -> str:
+        """Applies conversational instruction framing matching the SFT dataset."""
+        s = prompt.strip()
+        if s.startswith("User:") or s.startswith("System:") or s.startswith("def ") or s.startswith("import "):
+            return s
+        return f"User: {s}\nAssistant: "
+
     def generate_response(self, prompt: str, max_tokens: int = 128, temp: float = 0.5):
-        """Streams generation from model with Phase 5 state caching."""
+        """Streams generation from model using native CUDA engine (100+ tok/s) with fallback."""
+        stop_sequences = ["\nUser:", "User:", "<|endoftext|>"]
+        formatted_prompt = self.format_prompt(prompt)
+
+        if self.device == "cuda" and torch.cuda.is_available():
+            try:
+                from jarvis_engine.evaluate_jarvis import get_native_engine
+                native_eng = get_native_engine()
+                if native_eng is not None:
+                    prompt_ids = self.enc.encode_ordinary(formatted_prompt)
+                    if not prompt_ids:
+                        prompt_ids = [self.enc.eot_token]
+                    decoded_parts = []
+                    decoder = StreamingDecoder(self.enc)
+                    stopped = [False]
+
+                    def stream_cb(tok_id):
+                        if stopped[0]:
+                            return
+                        delta = decoder.push(tok_id)
+                        if delta:
+                            decoded_parts.append(delta)
+                            accum = "".join(decoded_parts)
+                            for stop_s in stop_sequences:
+                                if stop_s in accum:
+                                    stopped[0] = True
+                                    return
+                            sys.stdout.write(delta)
+                            sys.stdout.flush()
+
+                    native_eng.generate(prompt_ids, max_tokens, temp, 0.9, 50, stream_cb, 1.25)
+                    tail = decoder.finish()
+                    if tail and not stopped[0]:
+                        decoded_parts.append(tail)
+                        sys.stdout.write(tail)
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+
+                    result = "".join(decoded_parts)
+                    for stop_s in stop_sequences:
+                        if stop_s in result:
+                            result = result.split(stop_s, 1)[0]
+                    return result.strip()
+            except Exception:
+                pass  # Fall back to PyTorch
+
         self.model.eval()
         self.model.reset_state()
-        prompt_ids = self.enc.encode_ordinary(prompt)
+        prompt_ids = self.enc.encode_ordinary(formatted_prompt)
         if not prompt_ids:
             prompt_ids = [self.enc.eot_token]
 
         context = torch.tensor(prompt_ids, dtype=torch.long, device=self.device).unsqueeze(0)
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        with get_autocast(self.device):
             logits, _ = self.model(context, persist_state=True)
 
         next_logits = logits[:, -1, :].float()
         next_tok = sample_next_token(next_logits, temperature=temp, top_k=50, top_p=0.9,
-                                     repetition_penalty=1.15, prev_tokens=prompt_ids)
+                                     repetition_penalty=1.25, prev_tokens=prompt_ids,
+                                     no_repeat_ngram_size=3)
 
         token_ids = []
         decoded_parts = []
@@ -266,66 +319,40 @@ class JarvisAgent:
             token_ids.append(tid)
             delta = decoder.push(tid)
             decoded_parts.append(delta)
+            accum = "".join(decoded_parts)
+            if any(stop_s in accum for stop_s in stop_sequences):
+                break
             if delta:
                 sys.stdout.write(delta)
                 sys.stdout.flush()
 
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            with get_autocast(self.device):
                 logits, _ = self.model(next_tok, persist_state=True)
             next_logits = logits[:, -1, :].float()
             seen = prompt_ids + token_ids
             next_tok = sample_next_token(next_logits, temperature=temp, top_k=50, top_p=0.9,
-                                         repetition_penalty=1.15, prev_tokens=seen)
+                                         repetition_penalty=1.25, prev_tokens=seen,
+                                         no_repeat_ngram_size=3)
 
         tail = decoder.finish()
-        decoded_parts.append(tail)
-        sys.stdout.write(tail + "\n")
+        if tail:
+            decoded_parts.append(tail)
+            sys.stdout.write(tail)
+        sys.stdout.write("\n")
         sys.stdout.flush()
         self.model.reset_state()
-        return "".join(decoded_parts)
+        result = "".join(decoded_parts)
+        for stop_s in stop_sequences:
+            if stop_s in result:
+                result = result.split(stop_s, 1)[0]
+        return result.strip()
 
     def run_agentic_turn(self, user_query: str):
         """
         Executes an agentic reasoning & action cycle for a user query.
         """
         print(f"\n[JARVIS AGENT] Processing goal: '{user_query}'")
-
-        # Intent detection & template synthesis
-        q_lower = user_query.lower()
-        pyramid_keywords = ["pyramid", "pyramide", "star pattern", "triangle pattern"]
-        is_pyramid = any(k in q_lower for k in pyramid_keywords)
-        is_code_request = any(k in q_lower for k in ["code", "script", "python", "py", "function", "write"])
-
-        if is_pyramid and is_code_request:
-            print("→ Detected Code Generation & Execution Goal: Star Pyramid")
-            script = (
-                "def print_pyramid(n=5):\n"
-                "    for i in range(1, n + 1):\n"
-                "        spaces = ' ' * (n - i)\n"
-                "        stars = '*' * (2 * i - 1)\n"
-                "        print(spaces + stars)\n\n"
-                "print('--- STAR PYRAMID OUTPUT ---')\n"
-                "print_pyramid(5)\n"
-            )
-            print("\nAction: run_python")
-            print("```python")
-            print(script.strip())
-            print("```\n")
-
-            if self.auto_execute:
-                print("⚙ Executing generated Python script...")
-                result = AgentTools.run_python(script)
-                print("\nObservation:")
-                print("-" * 40)
-                print(result)
-                print("-" * 40)
-                print("\nFinal Answer: The Python star pyramid code has been generated and successfully executed above.")
-            return
-
-        # Direct model generation turn
-        prompt = f"User: {user_query}\nAssistant: "
-        print("Thinking...")
-        output = self.generate_response(prompt, max_tokens=100, temp=0.6)
+        output = self.generate_response(user_query, max_tokens=128, temp=0.6)
 
         # Detect any tool actions generated by the model
         tool_calls = extract_tool_calls(output)
@@ -340,13 +367,15 @@ def run_interactive_agent():
     global _CODE_EXECUTION_ENABLED
     parser = argparse.ArgumentParser(description="Jarvis Agentic AI Terminal")
     parser.add_argument("--ckpt", type=str, default=None, help="Checkpoint to load (optional)")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu", "mps"],
+                        help="Execution device: auto, cuda, cpu, or mps (default: auto)")
     parser.add_argument("--auto", action="store_true", default=False, help="Auto-execute generated tools")
     args = parser.parse_args()
 
     try:
         answer = input(
             "Allow model-generated Python and shell commands for this session? "
-            "They run with your Windows account permissions. Type YES to enable: "
+            "They run with your user account permissions. Type YES to enable: "
         ).strip()
     except (EOFError, KeyboardInterrupt):
         answer = ""
@@ -354,9 +383,10 @@ def run_interactive_agent():
     if not _CODE_EXECUTION_ENABLED:
         print("Python/CMD tools are disabled for this session; file and GPU tools remain available.")
 
-    model, ckpt_path, step = load_jarvis_model(args.ckpt, device="cuda")
+    device = resolve_device(args.device)
+    model, ckpt_path, step = load_jarvis_model(args.ckpt, device=device)
     enc = ENCODING
-    agent = JarvisAgent(model, enc, device="cuda")
+    agent = JarvisAgent(model, enc, device=device)
     agent.auto_execute = args.auto
 
     print("\n" + "=" * 60)

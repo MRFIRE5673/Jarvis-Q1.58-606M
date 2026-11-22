@@ -35,10 +35,15 @@ if not shutil.which("cl"):
 # 2. Detect or configure CUDA_HOME
 cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
 if not cuda_home:
-    cuda_candidates = sorted(
-        glob.glob(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*"),
-        reverse=True
-    )
+    if sys.platform == "win32":
+        cuda_candidates = sorted(
+            glob.glob(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*"),
+            reverse=True
+        )
+    else:
+        cuda_candidates = sorted(glob.glob("/usr/local/cuda-*"), reverse=True)
+        if os.path.isdir("/usr/local/cuda"):
+            cuda_candidates.insert(0, "/usr/local/cuda")
     if cuda_candidates:
         cuda_home = cuda_candidates[0]
         os.environ["CUDA_HOME"] = cuda_home
@@ -50,27 +55,54 @@ if cuda_home:
     if cuda_bin not in os.environ.get("PATH", ""):
         os.environ["PATH"] = cuda_bin + os.pathsep + os.environ.get("PATH", "")
 
-# 3. Relax PyTorch major-version check between PyTorch (12.8) and installed CUDA Toolkit (13.3)
-orig_check = cpp_ext._check_cuda_version
-def relaxed_check(compiler_name, compiler_version):
-    try:
-        orig_check(compiler_name, compiler_version)
-    except RuntimeError as e:
-        print(f"[setup.py] Note: Relaxed CUDA version check ({e}) to allow CUDA 13.3.")
-cpp_ext._check_cuda_version = relaxed_check
+# 3. Relax PyTorch major-version check between PyTorch and installed CUDA Toolkit
+orig_check = getattr(cpp_ext, "_check_cuda_version", None)
+if orig_check:
+    def relaxed_check(compiler_name, compiler_version):
+        try:
+            orig_check(compiler_name, compiler_version)
+        except RuntimeError as e:
+            print(f"[setup.py] Note: Relaxed CUDA version check ({e}).")
+    cpp_ext._check_cuda_version = relaxed_check
 
-# 4. Architecture and preprocessor flags for RTX 5070 (Blackwell sm_120) & CUDA 13.3 CCCL
-extra_cuda_cflags = [
+# 4. Architecture and preprocessor flags
+target_archs = []
+env_arch = os.environ.get("JARVIS_CUDA_ARCH") or os.environ.get("TORCH_CUDA_ARCH_LIST")
+if env_arch:
+    for arch in env_arch.replace(";", " ").split():
+        arch_clean = arch.strip().replace(".", "")
+        if arch_clean:
+            target_archs.append(f"-gencode=arch=compute_{arch_clean},code=sm_{arch_clean}")
+elif torch.cuda.is_available():
+    try:
+        cap = torch.cuda.get_device_capability()
+        arch_code = f"{cap[0]}{cap[1]}"
+        target_archs.append(f"-gencode=arch=compute_{arch_code},code=sm_{arch_code}")
+    except Exception:
+        pass
+
+if not target_archs:
+    target_archs = [
+        "-gencode=arch=compute_80,code=sm_80",
+        "-gencode=arch=compute_86,code=sm_86",
+        "-gencode=arch=compute_89,code=sm_89",
+        "-gencode=arch=compute_90,code=sm_90",
+        "-gencode=arch=compute_120,code=sm_120",
+    ]
+
+extra_cuda_cflags = target_archs + [
     "-O3",
     "--use_fast_math",
-    "-gencode=arch=compute_120,code=sm_120",
-    "-Xcompiler", "/Zc:preprocessor",
-    "-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING",
     "--ptxas-options=-v",
 ]
+if sys.platform == "win32":
+    extra_cuda_cflags.extend(["-Xcompiler", "/Zc:preprocessor", "-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING"])
+    cxx_flags = ["/O2", "/std:c++17", "/Zc:preprocessor", "-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING"]
+else:
+    cxx_flags = ["-O3", "-std=c++17", "-Wno-deprecated-declarations"]
 
 extra_compile_args = {
-    "cxx": ["/O2", "/std:c++17", "/Zc:preprocessor", "-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING"],
+    "cxx": cxx_flags,
     "nvcc": extra_cuda_cflags,
 }
 

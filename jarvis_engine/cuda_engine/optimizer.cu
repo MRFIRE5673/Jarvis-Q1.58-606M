@@ -95,7 +95,7 @@ __global__ void prepare_optimizer_step_kernel(
     float* d_lr,
     const float* d_grad_norm_sq,
     float beta1, float beta2, float grad_clip, float base_lr,
-    int warmup_steps, int decay_steps, float min_lr_ratio
+    int warmup_steps, int decay_steps, float min_lr_ratio, int lr_step_offset
 ) {
     if (threadIdx.x != 0) return;
     int t = atomicAdd(d_step_count, 1) + 1;  // pre-increment (t = new step)
@@ -116,11 +116,13 @@ __global__ void prepare_optimizer_step_kernel(
         *d_clip_coef = fminf(grad_clip / (gnorm + 1e-6f), 1.0f);
     }
 
+    int schedule_t = t - lr_step_offset;
+    if (schedule_t < 1) schedule_t = 1;
     float scale;
-    if (warmup_steps > 0 && t <= warmup_steps) {
-        scale = (float)t / (float)warmup_steps;
-    } else if (decay_steps > warmup_steps && t < decay_steps) {
-        float p = ((float)t - (float)warmup_steps) /
+    if (warmup_steps > 0 && schedule_t <= warmup_steps) {
+        scale = (float)schedule_t / (float)warmup_steps;
+    } else if (decay_steps > warmup_steps && schedule_t < decay_steps) {
+        float p = ((float)schedule_t - (float)warmup_steps) /
                   (float)(decay_steps - warmup_steps);
         p = fminf(fmaxf(p, 0.0f), 1.0f);
         scale = min_lr_ratio + 0.5f * (1.0f - min_lr_ratio) *
@@ -137,13 +139,13 @@ void launch_prepare_optimizer_step(
     float* d_clip_coef, float* d_lr,
     const float* d_grad_norm_sq,
     float beta1, float beta2, float grad_clip, float base_lr,
-    int warmup_steps, int decay_steps, float min_lr_ratio,
+    int warmup_steps, int decay_steps, float min_lr_ratio, int lr_step_offset,
     cudaStream_t s
 ) {
     prepare_optimizer_step_kernel<<<1, 32, 0, s>>>(
         d_step_count, d_bc1, d_bc2, d_clip_coef, d_lr,
         d_grad_norm_sq, beta1, beta2, grad_clip, base_lr,
-        warmup_steps, decay_steps, min_lr_ratio);
+        warmup_steps, decay_steps, min_lr_ratio, lr_step_offset);
     CUDA_CHECK_LAST();
 }
 

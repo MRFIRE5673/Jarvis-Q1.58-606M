@@ -201,6 +201,7 @@ void alloc_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     printf("[alloc_workspace] Allocating training workspace...\n");
 
     dev_alloc_i32 (&ws.token_ids,    (size_t)NT * cfg.accum_steps + 1, "token_ids");
+    CUDA_CHECK(cudaMalloc(&ws.target_mask, (size_t)NT * cfg.accum_steps * sizeof(unsigned char)));
     // Capture and warmup execute before the first host batch is copied in.
     // Zero is a valid vocabulary ID and prevents undefined embedding reads.
     CUDA_CHECK(cudaMemset(ws.token_ids, 0, ((size_t)NT * cfg.accum_steps + 1) * sizeof(int)));
@@ -241,7 +242,7 @@ void alloc_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
     dev_alloc_bf16(&ws.layer_h1,     route_rows * hi,    sparse_moe_requested_alloc() ? "layer_h1 [NTK,hi] compact" : "layer_h1 [E,NT,hi]");
     dev_alloc_bf16(&ws.expert_out,   route_rows * C,     sparse_moe_requested_alloc() ? "expert_out [NTK,C] compact" : "expert_out [E,NT,C]");
     dev_alloc_bf16(&ws.moe_out,      (size_t)NT * C,     "moe_out");
-    dev_alloc_fp32(&ws.lsf_alpha,    1,                  "lsf_alpha scalar");
+    dev_alloc_fp32(&ws.lsf_alpha,    kLsfAlphaWorkspaceFloats, "lsf_alpha reduction scratch");
     dev_alloc_bf16(&ws.lsf_h,        (size_t)L * B * C,  "lsf_h [L,B,C]");
     dev_alloc_bf16(&ws.lsf_out,      (size_t)NT * C,     "lsf_out");
 
@@ -333,7 +334,7 @@ void free_workspace(JarvisWorkspace& ws, const JarvisConfig& cfg) {
 
     #define FD(ptr) do { if (ptr) { cudaFree(ptr); ptr = nullptr; } } while(0)
 
-    FD(ws.token_ids); FD(ws.tok_emb_out);
+    FD(ws.token_ids); FD(ws.target_mask); FD(ws.tok_emb_out);
     FD(ws.layer_x);   FD(ws.layer_x2);
     FD(ws.norm1_out); FD(ws.qkv_out);
     FD(ws.q_buf);     FD(ws.k_buf);   FD(ws.v_buf);
