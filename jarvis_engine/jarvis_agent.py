@@ -386,7 +386,7 @@ def run_interactive_agent():
         ).strip()
     except (EOFError, KeyboardInterrupt):
         answer = ""
-    _CODE_EXECUTION_ENABLED = answer == "YES"
+    _CODE_EXECUTION_ENABLED = answer.strip().upper() in ("YES", "Y")
     if not _CODE_EXECUTION_ENABLED:
         print("Python/CMD tools are disabled for this session; file and GPU tools remain available.")
 
