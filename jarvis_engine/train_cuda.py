@@ -204,7 +204,7 @@ def validate_run_metadata(saved_step):
             allowed = {
                 "learning_rate", "corpus_steps", "steps_per_run", "train_tokens",
                 "warmup_steps", "decay_steps", "masked_targets",
-                "lr_step_offset",
+                "lr_step_offset", "sparse_moe",
             }
             if changed - allowed:
                 raise ValueError("SFT checkpoint model settings differ; only data, LR, and schedule may change.")
