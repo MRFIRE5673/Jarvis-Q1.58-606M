@@ -91,7 +91,7 @@ class SparseTopKRouter(nn.Module):
             # DeepSeek-V3 dynamic closed-loop bias update (outside autograd)
             if self.training:
                 with torch.no_grad():
-                    f = mask.mean(dim=0)
+                    f = mask.mean(dim=0) / self.top_k  # normalized route fraction (sum = 1.0)
                     target = 1.0 / self.num_experts
                     self.expert_bias.add_(-self.bias_gamma * (f - target))
             l_balance = torch.zeros((), device=x.device, dtype=x.dtype)

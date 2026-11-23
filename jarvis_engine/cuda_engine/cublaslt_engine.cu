@@ -30,9 +30,11 @@
     do {                                                                           \
         cublasStatus_t _s = (call);                                                \
         if (_s != CUBLAS_STATUS_SUCCESS) {                                         \
+            cudaError_t _ce = cudaGetLastError();                                  \
             char _buf[256];                                                        \
             snprintf(_buf, sizeof(_buf),                                           \
-                "[cuBLAS] %s:%d status=%d", __FILE__, __LINE__, (int)_s);         \
+                "[cuBLAS] %s:%d status=%d (cudaLastError=%s)",                     \
+                __FILE__, __LINE__, (int)_s, cudaGetErrorString(_ce));             \
             throw std::runtime_error(_buf);                                        \
         }                                                                          \
     } while(0)
@@ -173,7 +175,7 @@ void CublasLtEngine::gemm_fp8_cached(int M, int N, int K,
                                       const bf16* X, const bf16* W_bf16,
                                       const uint8_t* W_q8, const float* d_inv_w,
                                       bf16* Y, cudaStream_t s) const {
-    if (!fp8_fwd) {
+    if (!fp8_fwd || (M % 16 != 0)) {
         gemm({M, N, K}, X, W_bf16, Y, 1.f, 0.f, s);
         return;
     }
@@ -225,10 +227,13 @@ void CublasLtEngine::gemm_fp8_cached(int M, int N, int K,
     quant_fp8(X, x8, M, K, false, 0, f8_stat + 0, f8_stat + 2, s);
 
     float alpha = 1.f, beta = 0.f;
-    CUBLAS_CHECK((cublasStatus_t)cublasLtMatmul(lt, op, &alpha, W_q8, la, x8, lb, &beta,
-                                                Y, lc, Y, lc, &algo, lt_ws, wsz, s));
+    cublasStatus_t status = (cublasStatus_t)cublasLtMatmul(lt, op, &alpha, W_q8, la, x8, lb, &beta,
+                                                          Y, lc, Y, lc, &algo, lt_ws, wsz, s);
     cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(lc);
     cublasLtMatmulDescDestroy(op);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        gemm({M, N, K}, X, W_bf16, Y, 1.f, 0.f, s);
+    }
 }
 
 bool CublasLtEngine::grouped_expert_bf16(const bf16* X, const bf16* W, bf16* Y,
@@ -346,7 +351,7 @@ void CublasLtEngine::destroy() {
 }
 
 void CublasLtEngine::autotune_algorithms(const JarvisConfig& cfg) {
-    printf("[cuBLAS] Using cublasGemmEx CUBLAS_GEMM_DEFAULT_TENSOR_OP (SM120 BF16).\n");
+    printf("[cuBLAS] Using cublasGemmEx CUBLAS_GEMM_DEFAULT (SM120 BF16 TensorCore via math mode).\n");
     (void)cfg;
 }
 
@@ -372,8 +377,7 @@ void CublasLtEngine::gemm(const GemmDesc& d,
         &beta,
         C, CUDA_R_16BF, d.N,   // C_ptr: N rows col-major = C[M,N] row-major ✓
         CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-
+        CUBLAS_GEMM_DEFAULT));  // DEFAULT: TF32 TensorCore via cublasSetMathMode
 }
 
 // ---------------------------------------------------------------------------
@@ -432,7 +436,7 @@ void CublasLtEngine::gemm_nn(const GemmDesc& d,
         &beta,
         C, CUDA_R_16BF, d.N,   // C col[N,M] = C_row[M,N] ✓
         CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        CUBLAS_GEMM_DEFAULT));  // DEFAULT: TF32 TensorCore via math mode
 
 }
 
@@ -452,7 +456,7 @@ void CublasLtEngine::gemm_tn(const GemmDesc& d,
         &beta,
         C, CUDA_R_16BF, d.N,
         CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        CUBLAS_GEMM_DEFAULT));  // DEFAULT: TF32 TensorCore via math mode
 }
 
 // ---------------------------------------------------------------------------

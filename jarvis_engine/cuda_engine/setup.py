@@ -193,13 +193,22 @@ extra_compile_args = {
 
 # =============================================================================
 # 6. INCLUDE / LIBRARY PATHS
-# Use CUDA 13.3 cublasLt (has SM120 kernels + row-major layout support)
+# cublas64_12 (from PyTorch) works for BF16 cublasGemmEx on SM120.
+# cublasLt64_13 (from CUDA 13.3) needed for grouped layout API (new in 13.x).
 # =============================================================================
 include_dirs = []
 library_dirs = []
 
-# Link cublas from CUDA 13.3 toolkit (cublasGemmEx for SM120 BF16 TensorCore)
-libraries = ["cublas", "cublasLt"]
+import torch as _torch
+_torch_lib = os.path.join(os.path.dirname(_torch.__file__), "lib")
+
+# Prefer PyTorch's cublas for cublasGemmEx (SM120 BF16 works), use CUDA 13.3
+# cublasLt for grouped GEMM APIs not present in PyTorch's cublas64_12.
+if os.path.exists(os.path.join(_torch_lib, "cublas64_12.lib")):
+    library_dirs.insert(0, _torch_lib)
+    libraries = ["cublas64_12", "cublasLt"]  # cublas from torch, cublasLt from CUDA 13.3
+else:
+    libraries = ["cublas", "cublasLt"]
 
 if cuda_inc and os.path.exists(cuda_inc):
     include_dirs.append(cuda_inc)

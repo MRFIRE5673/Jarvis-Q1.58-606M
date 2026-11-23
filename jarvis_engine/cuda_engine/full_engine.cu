@@ -263,7 +263,7 @@ void JarvisEngine::forward_microstep(int ustep) {
     const int hi   = cfg.expert_hidden;
     const int Vp   = cfg.vocab_padded;
 
-    lt.fp8_fwd = true;   // FP8 E4M3 forward projections
+    lt.fp8_fwd = false;  // FP8 disabled: cublasLt FP8 corrupts CUDA ctx on SM120 (status=14)
     // === EMBEDDING ===
     const int* tok_ids = ws.token_ids + (size_t)ustep * NT;
     launch_tok_emb_fwd(tok_ids, params.tok_emb, ws.layer_x, NT, C, s);
@@ -567,7 +567,7 @@ void JarvisEngine::forward_microstep(int ustep) {
     auto& rt = get_runtime();
     cudaStream_t s = rt.get_stream();
     auto& lt = get_cublaslt();
-    lt.fp8_fwd = true;
+    lt.fp8_fwd = false;  // FP8 disabled: corrupts CUDA ctx on SM120
 
     const int NT = cfg.NT(), L = cfg.n_layers, C = cfg.d_model, E = cfg.n_experts;
     const int B = cfg.batch_size, T = cfg.seq_len, Vp = cfg.vocab_padded;
@@ -618,7 +618,7 @@ void JarvisEngine::backward_microstep(int ustep, float /*grad_scale*/) {
     cudaStream_t s = rt.get_stream();
     auto& lt = get_cublaslt();
     lt.fp8_fwd = false;
-    lt.fp8_bwd = true;
+    lt.fp8_bwd = false;  // FP8 bwd also poisons CUDA ctx on SM120 (cublasLtMatmul status=14)
 
     const int NT = cfg.NT(), L = cfg.n_layers, C = cfg.d_model, E = cfg.n_experts;
     const int hi = cfg.expert_hidden, Vp = cfg.vocab_padded;
