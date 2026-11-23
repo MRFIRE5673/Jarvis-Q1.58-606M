@@ -38,7 +38,14 @@ for p in [WORKSPACE_ROOT, JARVIS_ENGINE_PATH, SPARSE_DIR, ATTN_DIR]:
     if os.path.isdir(p) and p not in sys.path:
         sys.path.insert(0, p)
 
-from evaluate_jarvis import load_jarvis_model, sample_next_token
+from evaluate_jarvis import (
+    load_jarvis_model,
+    sample_next_token,
+    resolve_device,
+    get_autocast,
+    sync_device,
+    empty_device_cache,
+)
 from tokenizer import ENCODING, StreamingDecoder
 
 

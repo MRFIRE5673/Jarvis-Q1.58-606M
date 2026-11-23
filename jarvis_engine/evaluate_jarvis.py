@@ -110,6 +110,8 @@ def parse_args():
                         help="Launch interactive conversation terminal")
     parser.add_argument("--prompt", type=str, default=None,
                         help="Single prompt to evaluate directly")
+    parser.add_argument("--raw", action="store_true",
+                        help="Disable instruction framing (User: ... Assistant:) and generate raw text continuation")
     parser.add_argument("--max_new_tokens", type=int, default=128,
                         help="Maximum tokens to generate per response (default: 128)")
     parser.add_argument("--temperature", type=float, default=0.7,
@@ -573,11 +575,15 @@ def interactive_terminal(model, enc, args, ckpt_path, device="auto"):
             print_model_info(model, ckpt_path, device)
             continue
 
+        prompt_text = prompt
+        if not getattr(args, "raw", False) and not (prompt.startswith("User:") or prompt.startswith("System:")):
+            prompt_text = f"User: {prompt}\nAssistant: "
+
         print("\nResponse:")
         generate_streaming(
             model=model,
             enc=enc,
-            prompt_text=prompt,
+            prompt_text=prompt_text,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
@@ -661,12 +667,15 @@ def main():
 
     # 3. Single Prompt Evaluation Mode
     if args.prompt:
-        print(f"Prompt: {args.prompt}\n")
+        prompt_text = args.prompt
+        if not getattr(args, "raw", False) and not (prompt_text.strip().startswith("User:") or prompt_text.strip().startswith("System:")):
+            prompt_text = f"User: {prompt_text.strip()}\nAssistant: "
+        print(f"Prompt: {prompt_text}\n")
         print("Response:")
         generate_streaming(
             model=model,
             enc=enc,
-            prompt_text=args.prompt,
+            prompt_text=prompt_text,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
