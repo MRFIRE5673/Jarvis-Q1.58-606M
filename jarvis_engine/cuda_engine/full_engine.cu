@@ -1086,11 +1086,20 @@ void JarvisEngine::save_checkpoint(const char* path) {
     const int L = cfg.n_layers, C = cfg.d_model, E = cfg.n_experts, hi = cfg.expert_hidden;
     const int Vp = cfg.vocab_padded, H = cfg.n_heads;
 
+    // Use a single fixed chunk buffer (8 MB) to prevent heap fragmentation / std::bad_alloc
+    // during frequent multi-gigabyte checkpoint serialization.
+    constexpr size_t CHUNK_FLOATS = 2 * 1024 * 1024;
+    std::vector<float> chunk(CHUNK_FLOATS);
+
     auto write_fp32 = [&](const float* dev, size_t n) {
-        std::vector<float> h(n);
-        CUDA_CHECK(cudaMemcpy(h.data(), dev, n * sizeof(float), cudaMemcpyDeviceToHost));
-        f.write(reinterpret_cast<const char*>(h.data()), n * sizeof(float));
-        if (!f) throw std::runtime_error("Checkpoint write failed");
+        size_t offset = 0;
+        while (offset < n) {
+            size_t batch = std::min(n - offset, CHUNK_FLOATS);
+            CUDA_CHECK(cudaMemcpy(chunk.data(), dev + offset, batch * sizeof(float), cudaMemcpyDeviceToHost));
+            f.write(reinterpret_cast<const char*>(chunk.data()), batch * sizeof(float));
+            if (!f) throw std::runtime_error("Checkpoint write failed");
+            offset += batch;
+        }
     };
 
     write_fp32(params.tok_emb_fp32, (size_t)Vp * C);
@@ -1158,11 +1167,18 @@ void JarvisEngine::load_checkpoint(const char* path) {
         throw std::runtime_error("Checkpoint size does not match this model");
     f.seekg(sizeof(step_count), std::ios::beg);
 
+    constexpr size_t READ_CHUNK_FLOATS = 2 * 1024 * 1024;
+    std::vector<float> read_chunk(READ_CHUNK_FLOATS);
+
     auto read_fp32 = [&](float* dev, size_t n) {
-        std::vector<float> h(n);
-        f.read(reinterpret_cast<char*>(h.data()), n * sizeof(float));
-        if (!f) throw std::runtime_error("Truncated checkpoint");
-        CUDA_CHECK(cudaMemcpy(dev, h.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+        size_t offset = 0;
+        while (offset < n) {
+            size_t batch = std::min(n - offset, READ_CHUNK_FLOATS);
+            f.read(reinterpret_cast<char*>(read_chunk.data()), batch * sizeof(float));
+            if (!f) throw std::runtime_error("Truncated checkpoint");
+            CUDA_CHECK(cudaMemcpy(dev + offset, read_chunk.data(), batch * sizeof(float), cudaMemcpyHostToDevice));
+            offset += batch;
+        }
     };
 
     read_fp32(params.tok_emb_fp32, (size_t)Vp * C);
@@ -1179,10 +1195,10 @@ void JarvisEngine::load_checkpoint(const char* path) {
     // optional router section; if absent keep current router weights
     bool has_router = true;
     for (int l = 0; l < L && has_router; ++l) {
-        std::vector<float> h((size_t)E*C);
-        f.read(reinterpret_cast<char*>(h.data()), h.size() * sizeof(float));
+        size_t n = (size_t)E * C;
+        f.read(reinterpret_cast<char*>(read_chunk.data()), n * sizeof(float));
         if (!f) { has_router = false; break; }
-        CUDA_CHECK(cudaMemcpy(params.router_fp32[l], h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(params.router_fp32[l], read_chunk.data(), n * sizeof(float), cudaMemcpyHostToDevice));
     }
     if (has_adam) {
         read_fp32(params.tok_emb_m, (size_t)Vp*C); read_fp32(params.tok_emb_v, (size_t)Vp*C);
